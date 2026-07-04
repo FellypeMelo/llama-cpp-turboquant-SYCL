@@ -42,14 +42,15 @@ static void k_turbo_wht_f32_sycl(
     } else if (group_size == 64) {
         val *= (direction == 0) ? TURBO_WHT_SIGNS1_64[t] : TURBO_WHT_SIGNS2_64[t];
     } else {
-        val *= (direction == 0) ? TURBO_WHT_SIGNS1[t] : TURBO_WHT_SIGNS2[t];
+        // group_size == 32: TQ weight signs (same for forward and inverse)
+        val *= TQ_SIGNS[t];
     }
 
     turbo_wht<group_size>(val, item_ct1, shared_mem);
 
     constexpr float inv_sqrt = (group_size == 128) ? 0.08838834764831845f :
                                (group_size == 64)  ? 0.125f :
-                                                     0.17677669529663688f;
+                                                     0.17677669529663688f; // 1/sqrt(32)
 
     float result;
     if (group_size == 128) {
@@ -59,8 +60,8 @@ static void k_turbo_wht_f32_sycl(
         result = val * inv_sqrt *
             ((direction == 0) ? TURBO_WHT_SIGNS2_64[t] : TURBO_WHT_SIGNS1_64[t]);
     } else {
-        result = val * inv_sqrt *
-            ((direction == 0) ? TURBO_WHT_SIGNS2[t] : TURBO_WHT_SIGNS1[t]);
+        // group_size == 32: normalize only (signs already applied before butterfly)
+        result = val * inv_sqrt;
     }
 
     if (direction == 1 && scale_inv != nullptr) {

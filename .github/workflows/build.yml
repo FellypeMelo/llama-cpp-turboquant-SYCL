@@ -656,6 +656,56 @@ jobs:
             -DGGML_SYCL_F16=ON
           time cmake --build build --config Release -j $(nproc)
 
+  # Build-only gate for the TurboQuant SYCL test binaries (test-sycl-turbo and friends).
+  # Hosted runners have no Intel GPU, so this cannot execute the tests, but it does catch
+  # build regressions (e.g. the SYCL test targets silently failing to compile) that the
+  # continue-on-error ubuntu-22-sycl jobs above would otherwise mask.
+  ubuntu-22-sycl-turbo-tests:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: add oneAPI to apt
+        shell: bash
+        run: |
+          cd /tmp
+          wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          rm GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo add-apt-repository "deb https://apt.repos.intel.com/oneapi all main"
+
+      - name: install oneAPI dpcpp compiler
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install intel-oneapi-compiler-dpcpp-cpp libssl-dev
+
+      - name: install oneAPI MKL library
+        shell: bash
+        run: |
+          sudo apt install intel-oneapi-mkl-devel
+
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: ubuntu-22-sycl-turbo-tests
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Build TurboQuant SYCL tests
+        id: cmake_build
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake -B build \
+            -DGGML_SYCL=ON \
+            -DCMAKE_C_COMPILER=icx \
+            -DCMAKE_CXX_COMPILER=icpx
+          cmake --build build --config Release -j $(nproc) \
+            --target test-sycl-turbo test-stress-context test-sycl-fuzz test-sycl-stress-deep
+
   ubuntu-24-openvino:
       name: ubuntu-24-openvino-${{ matrix.openvino_device }}
       strategy:

@@ -59,7 +59,7 @@ typedef half2 ggml_half2;
 
 #define GGML_COMMON_DECL
 #elif defined(GGML_COMMON_DECL_SYCL)
-#include <sycl/half_type.hpp>
+#include <sycl/sycl.hpp>
 #include <cstdint>
 
 typedef sycl::half  ggml_half;

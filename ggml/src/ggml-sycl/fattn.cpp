@@ -284,11 +284,5 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-    if (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
-        V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) {
-        return false;
-    }
     return ggml_sycl_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

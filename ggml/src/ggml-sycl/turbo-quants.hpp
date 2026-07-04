@@ -249,7 +249,7 @@ static const float TQ_SIGNS[32] = {
 
 static __dpct_inline__ float dequantize_tq4_1s(const block_tq4_1s * x, int j) {
     const float d = (j < 16) ? (float)x->d0 : (float)x->d1;
-    const uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    const uint8_t idx = (x->qs[j >> 1] >> ((j & 1) << 2)) & 0xF;
     return TQ_CENTROIDS_4BIT[idx] * d;
 }
 
@@ -260,22 +260,12 @@ static __dpct_inline__ float dequantize_tq3_1s(const block_tq3_1s * x, int j) {
     // 0: [0] low 3
     // 1: [0] next 3
     // 2: [0] bit 6-7, [1] bit 0
-    // Actually using Metal/CUDA reference packing:
     const int ig = j / 8; // group of 8
     const int i  = j % 8; // index in group
-    const uint8_t * qs = x->qs + 3*ig;
+    const uint8_t * qp = x->qs + 3*ig;
+    const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
+    const uint8_t idx = (packed >> (i * 3)) & 7;
     
-    uint8_t idx = 0;
-    switch (i) {
-        case 0: idx =  qs[0]        & 7; break;
-        case 1: idx = (qs[0] >> 3)  & 7; break;
-        case 2: idx = (qs[0] >> 6)  | ((qs[1] << 2) & 7); break;
-        case 3: idx = (qs[1] >> 1)  & 7; break;
-        case 4: idx = (qs[1] >> 4)  & 7; break;
-        case 5: idx = (qs[1] >> 7)  | ((qs[2] << 1) & 7); break;
-        case 6: idx = (qs[2] >> 2)  & 7; break;
-        case 7: idx = (qs[2] >> 5)  & 7; break;
-    }
     return TQ_CENTROIDS_3BIT[idx] * d;
 }
 

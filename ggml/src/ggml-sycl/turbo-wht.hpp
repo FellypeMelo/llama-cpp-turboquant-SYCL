@@ -37,7 +37,7 @@ static __dpct_inline__ void turbo_wht(T &val, const sycl::nd_item<DIM> &item_ct1
     #pragma unroll
     for (int step = 1; step < D; step <<= 1) {
         if (step < hw_sg_size) {
-            T other = dpct::permute_sub_group_by_xor(sg, val, step, hw_sg_size);
+            T other = sycl::select_from_group(sg, val, lane_id ^ step);
             if (lane_id & step) {
                 val = other - val;
             } else {

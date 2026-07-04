@@ -204,6 +204,23 @@ static __dpct_inline__ void dequantize_turbo4_0(const void *vx, const int64_t ib
     v.y() = dequantize_turbo4_0(&x[ib], iqs + 1, norm);
 }
 
+// Named distinctly (not overloading dequantize_tq3_1s/dequantize_tq4_1s from turbo-quants.hpp,
+// which take a differently-typed single-element signature and are used by the DMMV path) to
+// keep the two call sites unambiguous.
+static __dpct_inline__ void dequantize_tq3_1s_pair(const void *vx, const int64_t ib,
+                                                   const int iqs, dfloat2 &v) {
+    const block_tq3_1s * x = (const block_tq3_1s *) vx;
+    v.x() = dequantize_tq3_1s(&x[ib], iqs + 0);
+    v.y() = dequantize_tq3_1s(&x[ib], iqs + 1);
+}
+
+static __dpct_inline__ void dequantize_tq4_1s_pair(const void *vx, const int64_t ib,
+                                                   const int iqs, dfloat2 &v) {
+    const block_tq4_1s * x = (const block_tq4_1s *) vx;
+    v.x() = dequantize_tq4_1s(&x[ib], iqs + 0);
+    v.y() = dequantize_tq4_1s(&x[ib], iqs + 1);
+}
+
 template<typename dst_t>
 static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                   const sycl::nd_item<3> &item_ct1) {

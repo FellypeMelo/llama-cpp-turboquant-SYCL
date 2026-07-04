@@ -691,6 +691,10 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_block_sycl<QK_TURBO3, 1, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_sycl<QK_TURBO4, 1, dequantize_turbo4_0>;
+        case GGML_TYPE_TQ3_1S:
+            return dequantize_block_sycl<QK_TQ3_0, 1, dequantize_tq3_1s_pair>;
+        case GGML_TYPE_TQ4_1S:
+            return dequantize_block_sycl<QK_TQ4_1S, 1, dequantize_tq4_1s_pair>;
         default:
             GGML_ABORT("fatal error: unsupport data type=%s\n", ggml_type_name(type));
             return nullptr;
@@ -765,6 +769,10 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_block_sycl<QK_TURBO3, 1, dequantize_turbo3_0>;
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_sycl<QK_TURBO4, 1, dequantize_turbo4_0>;
+        case GGML_TYPE_TQ3_1S:
+            return dequantize_block_sycl<QK_TQ3_0, 1, dequantize_tq3_1s_pair>;
+        case GGML_TYPE_TQ4_1S:
+            return dequantize_block_sycl<QK_TQ4_1S, 1, dequantize_tq4_1s_pair>;
 
         case GGML_TYPE_F16:
             return convert_unary_sycl<sycl::half>;
@@ -800,4 +808,53 @@ to_fp16_nc_sycl_t ggml_get_to_fp16_nc_sycl(ggml_type type) {
         default:
             return nullptr;
     }
+}
+
+static void k_convert_tq4_1s_to_q8_0(const block_tq4_1s * __restrict__ src, block_q8_0 * __restrict__ dst, const int n_blocks, const sycl::nd_item<3> &item_ct1) {
+    const int block_idx = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (block_idx >= n_blocks) return;
+    const int lane = item_ct1.get_local_id(2);
+    const block_tq4_1s * blk = &src[block_idx];
+
+    // dequantize_tq4_1s uses scalar operations, we adapt it to subgroup for efficiency
+    const float d_scale = (lane < 16) ? (float)blk->d0 : (float)blk->d1;
+    const uint8_t idx = (blk->qs[lane >> 1] >> ((lane & 1) << 2)) & 0xF;
+    float val = TQ_CENTROIDS_4BIT[idx] * d_scale;
+
+    auto sg = item_ct1.get_sub_group();
+    
+    // WHT inverse
+    #pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = sycl::select_from_group(sg, val, lane ^ h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+    val *= 0.17677669529663688f; // 1/sqrt(32)
+    val *= TQ_SIGNS[lane];
+
+    float amax = sycl::fabs(val);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = sycl::fmax(amax, sycl::select_from_group(sg, amax, lane ^ off));
+    }
+
+    const float d = amax / 127.0f;
+    const float id = (d > 0.0f) ? 127.0f / amax : 0.0f;
+
+    dst[block_idx].qs[lane] = (int8_t)sycl::round(val * id);
+    if (lane == 0) {
+        dst[block_idx].d = sycl::vec<sycl::half, 1>(d);
+    }
+}
+
+void ggml_sycl_convert_tq4_1s_to_q8_0(const void * src, void * dst, const int64_t n_elements, dpct::queue_ptr stream) {
+    const int n_blocks = n_elements / 32;
+    const int wpb = 4;
+    
+    sycl::range<3> block(1, wpb, 32);
+    sycl::range<3> grid(1, 1, (n_blocks + wpb - 1) / wpb);
+    
+    stream->parallel_for(sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+        k_convert_tq4_1s_to_q8_0((const block_tq4_1s *)src, (block_q8_0 *)dst, n_blocks, item_ct1);
+    });
 }

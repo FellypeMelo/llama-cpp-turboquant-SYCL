@@ -48,6 +48,7 @@
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -418,6 +419,14 @@ static void * ggml_backend_sycl_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dev_ptr;
 }
 
+static bool ggml_sycl_tq_convert_q8() {
+    static int val = -1;
+    if (val == -1) {
+        val = get_sycl_env("GGML_TQ_NATIVE", 0) == 1 ? 0 : 1; // default ON, GGML_TQ_NATIVE=1 disables
+    }
+    return val == 1;
+}
+
 static enum ggml_status
 ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
                                      ggml_tensor *tensor) try {
@@ -477,6 +486,24 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl_set_device(ctx->device);
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+
+    if (ggml_sycl_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor)) {
+        const int64_t n_elements = ggml_nelements(tensor);
+        void * tmp_tq4 = sycl::malloc_device(size, *stream);
+#ifndef _WIN32
+        char * host_buf = (char *) malloc(size);
+        memcpy(host_buf, data, size);
+        stream->memcpy(tmp_tq4, host_buf, size).wait();
+        free(host_buf);
+#else
+        stream->memcpy(tmp_tq4, data, size).wait();
+#endif
+        ggml_sycl_convert_tq4_1s_to_q8_0(tmp_tq4, (char *)tensor->data + offset, n_elements, stream);
+        stream->wait();
+        sycl::free(tmp_tq4, *stream);
+        tensor->type = GGML_TYPE_Q8_0;
+        return;
+    }
 #ifndef _WIN32
     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
     // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
@@ -716,6 +743,11 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
+
+    if (ggml_sycl_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
+        const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
+        size = n_blocks * sizeof(block_q8_0);
+    }
 
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
@@ -1154,7 +1186,11 @@ static size_t ggml_backend_sycl_split_buffer_type_get_alloc_size(ggml_backend_bu
             continue;
         }
 
-        total_size += ggml_nbytes_split(tensor, nrows_split);
+        int64_t size_split = ggml_nbytes_split(tensor, nrows_split);
+        if (ggml_sycl_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
+            size_split = (size_split / sizeof(block_tq4_1s)) * sizeof(block_q8_0);
+        }
+        total_size += size_split;
 
         // pad last row to a multiple of 512 elements to avoid out-of-bounds memory accesses
         if (ne0 % MATRIX_ROW_PADDING != 0) {

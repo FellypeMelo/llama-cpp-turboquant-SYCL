@@ -1527,7 +1527,7 @@ static void k_tq_prerotate_activation(
     // Dynamic Subgroup WHT
     #pragma unroll
     for (int step = 1; step < sg_size; step <<= 1) {
-        float o = dpct::permute_sub_group_by_xor(sg, val, step, sg_size);
+        float o = sycl::select_from_group(sg, val, lane ^ step);
         val = (lane & step) ? (o - val) : (val + o);
     }
     val *= (float)(1.0f / sycl::sqrt((float)sg_size));

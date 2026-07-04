@@ -50,6 +50,6 @@ template<typename dst_t, typename src_t>
         return float(x);
     }
 }
-
+void ggml_sycl_convert_tq4_1s_to_q8_0(const void * src, void * dst, const int64_t n_elements, dpct::queue_ptr stream);
 
 #endif  // GGML_SYCL_CONVERT_HPP

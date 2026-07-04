@@ -1,6 +1,8 @@
 #include "ggml.h"
 #include "ggml-sycl.h"
 #include "ggml-backend.h"
+#define GGML_COMMON_DECL_SYCL
+#include "../ggml/src/ggml-common.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -22,7 +24,7 @@ extern "C" {
     void turbo_cpu_fwht(float * x, int group_size);
 }
 
-static void run_test(ggml_backend_t backend, ggml_type type, const char * name, 
+static bool run_test(ggml_backend_t backend, ggml_type type, const char * name, 
                     void (*quant_ref)(const float *, void *, int64_t),
                     void (*dequant_ref)(const void *, float *, int64_t)) {
     const int d = 128;
@@ -88,17 +90,23 @@ static void run_test(ggml_backend_t backend, ggml_type type, const char * name,
 
     float cosine = cosv / (sqrtf(ni) * sqrtf(no));
     printf("  MSE: %.8f, Cosine: %.6f\n", mse / d, cosine);
-    if (mse / d > 1e-5 || cosine < 0.99) {
+    bool pass = !(std::isnan(mse) || std::isnan(cosine)) && (mse / d <= 1e-5 && cosine >= 0.99);
+    if (!pass) {
         printf("  FAILED\n");
+        printf("  First 5 values: SYCL vs REF:\n");
+        for (int i = 0; i < std::min(5, d); i++) {
+            printf("    [%d] SYCL: %f, REF: %f\n", i, sycl_float[i], ref_float[i]);
+        }
     } else {
         printf("  PASSED\n");
     }
 
     ggml_free(ctx_sycl);
     ggml_backend_buffer_free(buffer);
+    return pass;
 }
 
-static void run_weight_test(ggml_backend_t backend, ggml_type type, const char * name,
+static bool run_weight_test(ggml_backend_t backend, ggml_type type, const char * name,
                            void (*quant_ref)(const float *, void *, int64_t),
                            void (*dequant_ref)(const void *, float *, int64_t)) {
     const int M = 32; // rows
@@ -162,30 +170,204 @@ static void run_weight_test(ggml_backend_t backend, ggml_type type, const char *
     }
     float cosine = cosv / (sqrtf(ni) * sqrtf(no));
     printf("  MSE: %.8f, Cosine: %.6f\n", mse / M, cosine);
-    if (mse / M > 1e-4 || cosine < 0.99) {
+    bool pass = !(std::isnan(mse) || std::isnan(cosine)) && (mse / M <= 1e-4 && cosine >= 0.99);
+    if (!pass) {
         printf("  FAILED\n");
+        printf("  First 5 values: SYCL vs REF:\n");
+        for (int i = 0; i < std::min(5, M); i++) {
+            printf("    [%d] SYCL: %f, REF: %f\n", i, sycl_result[i], ref_result[i]);
+        }
     } else {
         printf("  PASSED\n");
     }
 
     ggml_free(ctx_sycl);
     ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
+// Reference sign array for the TQ weight (group_size == 32) WHT rotation.
+// Values copied from ggml-turbo-quant.c's TQ3_0_SIGNS / ggml-cuda's TQ_WEIGHT_SIGNS /
+// ggml-sycl's TQ_SIGNS — all three must be identical for the rotation to be correct.
+static const float kTqSigns32[32] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
+};
+
+// CPU reference for GGML_OP_TURBO_WHT at group_size == 32: sign flip -> butterfly -> normalize.
+// Mirrors tq3_0_rht_forward() in ggml-turbo-quant.c and the group_size==32 branch of
+// ggml-cuda/turbo-wht.cu (this is the exact case that regressed in the SYCL port: the
+// SYCL kernel used to reuse the 128-element KV sign tables and apply signs twice).
+static void turbo_wht32_forward_ref(float * x) {
+    for (int i = 0; i < 32; i++) x[i] *= kTqSigns32[i];
+    for (int h = 1; h < 32; h <<= 1) {
+        for (int i = 0; i < 32; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j], b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt32 = 0.17677669529663688f;
+    for (int i = 0; i < 32; i++) x[i] *= inv_sqrt32;
+}
+
+// Regression test for the group_size==32 GGML_OP_TURBO_WHT sign-table bug: builds a
+// real GGML_OP_TURBO_WHT graph node on the SYCL backend and compares against the CPU
+// reference rotation used at TQ3_1S/TQ4_1S quantization time.
+static bool run_wht32_test(ggml_backend_t backend) {
+    printf("Testing GGML_OP_TURBO_WHT group_size=32 on SYCL...\n");
+
+    struct ggml_init_params params = { 2 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+    struct ggml_tensor * out   = ggml_turbo_wht(ctx, input, /*direction=*/0, /*group_size=*/32, /*scale=*/nullptr);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> host_input(32);
+    for (int i = 0; i < 32; i++) host_input[i] = sinf(i * 0.37f + 0.2f) * 1.5f;
+    ggml_backend_tensor_set(input, host_input.data(), 0, 32 * sizeof(float));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_backend_graph_compute(backend, gf);
+
+    std::vector<float> sycl_out(32);
+    ggml_backend_tensor_get(out, sycl_out.data(), 0, 32 * sizeof(float));
+
+    std::vector<float> ref_out = host_input;
+    turbo_wht32_forward_ref(ref_out.data());
+
+    float mse = 0, cosv = 0, ni = 0, no = 0;
+    for (int i = 0; i < 32; i++) {
+        float s = sycl_out[i], r = ref_out[i];
+        mse += (s - r) * (s - r); cosv += s * r; ni += r * r; no += s * s;
+    }
+    float cosine = cosv / (sqrtf(ni) * sqrtf(no));
+    printf("  MSE: %.8f, Cosine: %.6f\n", mse / 32, cosine);
+    bool pass = !(std::isnan(mse) || std::isnan(cosine)) && (mse / 32 <= 1e-8 && cosine >= 0.9999f);
+    if (!pass) {
+        printf("  FAILED\n");
+        for (int i = 0; i < 8; i++) {
+            printf("    [%d] SYCL: %f, REF: %f\n", i, sycl_out[i], ref_out[i]);
+        }
+    } else {
+        printf("  PASSED\n");
+    }
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
+// Regression test for the flash-attention turbo KV-cache gate: ggml_sycl_flash_attn_ext_supported()
+// used to hard-reject any K/V of a TURBO type before even checking kernel availability, even
+// though the underlying tile kernel is fully implemented. This builds a real
+// GGML_OP_FLASH_ATTN_EXT graph with TURBO3_0 K/V and checks it actually executes and produces
+// finite output, instead of aborting or being silently skipped.
+static bool run_fattn_turbo_smoke_test(ggml_backend_t backend) {
+    printf("Testing Flash-Attention with TURBO3_0 KV cache on SYCL...\n");
+
+    const int D     = 128; // head dim, matches QK_TURBO3 block size
+    const int n_kv   = 256; // must be a multiple of FATTN_KQ_STRIDE (256)
+    const int n_head = 1;
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 1, n_head, 1);
+    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO3_0, D, n_kv, n_head, 1);
+    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO3_0, D, n_kv, n_head, 1);
+
+    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
+                                                    1.0f / sqrtf((float) D), 0.0f, 0.0f);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> host_q(D);
+    for (int i = 0; i < D; i++) host_q[i] = sinf(i * 0.1f + 0.3f);
+    ggml_backend_tensor_set(q, host_q.data(), 0, D * sizeof(float));
+
+    std::vector<float> host_kv(D * n_kv);
+    for (int i = 0; i < D * n_kv; i++) host_kv[i] = sinf(i * 0.05f + 0.7f) * 0.5f;
+
+    std::vector<char> quantized_kv(ggml_nbytes(k));
+    quantize_row_turbo3_0_ref(host_kv.data(), quantized_kv.data(), D * n_kv);
+    ggml_backend_tensor_set(k, quantized_kv.data(), 0, quantized_kv.size());
+    ggml_backend_tensor_set(v, quantized_kv.data(), 0, quantized_kv.size());
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_status status = ggml_backend_graph_compute(backend, gf);
+
+    bool pass = status == GGML_STATUS_SUCCESS;
+    if (pass) {
+        std::vector<float> result(ggml_nelements(out));
+        ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
+        for (float val : result) {
+            if (std::isnan(val) || std::isinf(val)) { pass = false; break; }
+        }
+    }
+    printf("  graph_compute status: %d, %s\n", (int) status, pass ? "PASSED" : "FAILED");
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
 }
 
 int main() {
+    // Structural assertions for TurboQuant block layouts (TDD validation)
+    printf("Validating TurboQuant block layouts...\n");
+    printf("  block_turbo2_0: %zu bytes\n", sizeof(block_turbo2_0));
+    printf("  block_turbo3_0: %zu bytes\n", sizeof(block_turbo3_0));
+    printf("  block_turbo4_0: %zu bytes\n", sizeof(block_turbo4_0));
+    printf("  block_tq3_1s:   %zu bytes\n", sizeof(block_tq3_1s));
+    printf("  block_tq4_1s:   %zu bytes\n", sizeof(block_tq4_1s));
+
+    if (sizeof(block_turbo2_0) != 34) {
+        fprintf(stderr, "FAIL: block_turbo2_0 size mismatch (expected 34)\n");
+        return 1;
+    }
+    if (sizeof(block_turbo3_0) != 50) {
+        fprintf(stderr, "FAIL: block_turbo3_0 size mismatch (expected 50)\n");
+        return 1;
+    }
+    if (sizeof(block_turbo4_0) != 68) {
+        fprintf(stderr, "FAIL: block_turbo4_0 size mismatch (expected 68)\n");
+        return 1;
+    }
+    if (sizeof(block_tq3_1s) != 16) {
+        fprintf(stderr, "FAIL: block_tq3_1s size mismatch (expected 16)\n");
+        return 1;
+    }
+    if (sizeof(block_tq4_1s) != 20) {
+        fprintf(stderr, "FAIL: block_tq4_1s size mismatch (expected 20)\n");
+        return 1;
+    }
+    printf("  All layouts structurally valid.\n\n");
+
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
         fprintf(stderr, "Failed to initialize SYCL backend\n");
         return 1;
     }
 
-    run_test(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, dequantize_row_turbo3_0);
-    run_test(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, dequantize_row_turbo2_0);
-    run_test(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, dequantize_row_turbo4_0);
+    bool success = true;
+    success &= run_test(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, dequantize_row_turbo3_0);
+    success &= run_test(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, dequantize_row_turbo2_0);
+    success &= run_test(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, dequantize_row_turbo4_0);
 
-    run_weight_test(backend, GGML_TYPE_TQ3_1S, "TQ3_1S", quantize_row_tq3_1s_ref, dequantize_row_tq3_1s);
-    run_weight_test(backend, GGML_TYPE_TQ4_1S, "TQ4_1S", quantize_row_tq4_1s_ref, dequantize_row_tq4_1s);
+    success &= run_weight_test(backend, GGML_TYPE_TQ3_1S, "TQ3_1S", quantize_row_tq3_1s_ref, dequantize_row_tq3_1s);
+    success &= run_weight_test(backend, GGML_TYPE_TQ4_1S, "TQ4_1S", quantize_row_tq4_1s_ref, dequantize_row_tq4_1s);
+
+    success &= run_wht32_test(backend);
+    success &= run_fattn_turbo_smoke_test(backend);
 
     ggml_backend_free(backend);
-    return 0;
+    return success ? 0 : 1;
 }

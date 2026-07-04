@@ -200,6 +200,10 @@ llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 
 if (GGML_SYCL)
+    # These test binaries include SYCL headers directly (via ggml-common.h), so they need
+    # -fsycl themselves; ggml-sycl only applies it PRIVATE and it does not propagate here.
+    set(SYCL_TEST_TARGETS test-sycl-turbo test-stress-context test-sycl-fuzz test-sycl-stress-deep)
+
     add_executable(test-sycl-turbo test-sycl-turbo.cpp)
     target_link_libraries(test-sycl-turbo PRIVATE llama-common ggml-sycl)
     add_test(NAME test-sycl-turbo COMMAND test-sycl-turbo)
@@ -215,6 +219,11 @@ if (GGML_SYCL)
     add_executable(test-sycl-stress-deep test-sycl-stress-deep.cpp)
     target_link_libraries(test-sycl-stress-deep PRIVATE llama-common ggml-sycl)
     add_test(NAME test-sycl-stress-deep COMMAND test-sycl-stress-deep)
+
+    foreach(sycl_test_target ${SYCL_TEST_TARGETS})
+        target_compile_options(${sycl_test_target} PRIVATE "-fsycl")
+        target_link_options(${sycl_test_target} PRIVATE "-fsycl")
+    endforeach()
 endif()
 llama_build_and_test(
     test-peg-parser.cpp
