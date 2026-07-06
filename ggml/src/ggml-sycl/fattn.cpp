@@ -146,6 +146,12 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    // Auto-asymmetric mixed-KV: for high-GQA models (>=6:1) the KV cache upgrades K to q8_0 to
+    // protect quality while V stays turbo (llama-kv-cache.cpp). K=q8_0 uses the normal split
+    // nthreads_KQ (no full-D-Q register pressure), so D=128 is safe here too.
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
     GGML_ABORT("Not match KV type in vec");
@@ -219,8 +225,17 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_SYCL_FA_ALL_QUANTS
-    if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+    {
+        // Turbo KV may legitimately be asymmetric: the auto-asymmetric path upgrades K to q8_0
+        // while V stays turbo (GQA >= 6). The graph gates the forward Q-WHT on K and the output
+        // inverse-WHT on V independently, and the vec kernel dequantizes K and V by independent
+        // types, so such pairs are valid. Only reject asymmetric pairs where NEITHER side is turbo.
+        const bool kv_has_turbo =
+            K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+            V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+        if (K->type != V->type && !kv_has_turbo) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
