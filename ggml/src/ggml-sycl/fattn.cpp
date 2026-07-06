@@ -152,9 +152,18 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
+    // K=turbo / V=q8_0 mixed-KV: arises from layer-adaptive Boundary-V mode 7 (TURBO_LAYER_ADAPTIVE=7)
+    // or an explicit "-ctk turboN -ctv q8_0". K stays turbo so Q is still WHT-rotated; V=q8_0 is
+    // unrotated and the graph skips the inverse-WHT on those layers (gated on V->type turbo). turbo3/
+    // turbo4 K are solid here; turbo2 K (2-bit) is marginal, so the turbo2-V auto path defaults to the
+    // symmetric mode 8 (q8_0 boundaries) instead of mode 7 (llama-kv-cache.cpp).
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
-    GGML_ABORT("Not match KV type in vec");
+    GGML_ABORT("Not match KV type in vec: Q->ne[0]=%d K->type=%s V->type=%s",
+               (int) Q->ne[0], ggml_type_name(K->type), ggml_type_name(V->type));
 }
 
 // Best FlashAttention kernel for a specific GPU:

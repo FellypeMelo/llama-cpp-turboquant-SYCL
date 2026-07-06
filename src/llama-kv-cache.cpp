@@ -271,7 +271,11 @@ llama_kv_cache::llama_kv_cache(
         //   2 = q8_0 K+V for last 8 layers
         //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
         //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
-        //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
+        //   7 = Boundary V: first2+last2 V=q8_0, rest V=turbo2 (K unchanged) — mixed K=turbo/V=q8_0
+        //       (NOTE: the SYCL VEC kernel is unreliable for K=turbo + V=q8_0, so prefer mode 8)
+        //   8 = Boundary symmetric q8_0 (SYCL default for turbo2): first2+last2 K=q8_0 AND V=q8_0,
+        //       rest K/V=turbo2. Keeps every layer symmetric so only proven q8_0/q8_0 and
+        //       turbo2/turbo2 FA paths run — no mixed K=turbo/V=q8_0.
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
@@ -284,10 +288,13 @@ llama_kv_cache::llama_kv_cache(
                     }
                     return mode;
                 }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
+                // Auto-enable Boundary symmetric q8_0 (mode 8) when V is turbo2. Mode 7 (V-only
+                // q8_0) would make the boundary layers K=turbo2/V=q8_0, which the SYCL VEC kernel
+                // handles unreliably (nthreads_KQ=1 turbo K + nthreads_V=warp q8_0 V); mode 8 keeps
+                // the boundaries symmetric q8_0 so only proven FA paths run.
                 if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
+                    LLAMA_LOG_INFO("llama_kv_cache: Boundary symmetric q8_0 auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+                    return 8;
                 }
                 return 0;
             }();
@@ -318,11 +325,25 @@ llama_kv_cache::llama_kv_cache(
                     LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
                 }
             } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
-                // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
+                // Boundary V: first2+last2 V=q8_0, rest V=turbo2 (K stays turbo -> mixed on boundaries)
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
+                }
+            } else if (adaptive_mode == 8 && v_is_turbo && n_layer >= 8) {
+                // Boundary symmetric q8_0: first2+last2 K=q8_0 AND V=q8_0, rest K/V=turbo2.
+                // Symmetric on every layer -> no mixed K=turbo/V=q8_0 (which the SYCL VEC kernel
+                // handles unreliably); boundaries use the proven q8_0/q8_0 FA path.
+                const bool is_boundary = (il < 2 || il >= n_layer - 2);
+                if (is_boundary) {
+                    layer_type_k = GGML_TYPE_Q8_0;
+                    layer_type_v = GGML_TYPE_Q8_0;
+                } else {
+                    layer_type_v = GGML_TYPE_TURBO2_0;
+                }
+                if (il == 0) {
+                    LLAMA_LOG_INFO("llama_kv_cache: Boundary symmetric q8_0 mode 8: first2+last2 K+V=q8_0, rest turbo2\n");
                 }
             }
         }
