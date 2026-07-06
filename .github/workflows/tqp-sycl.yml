@@ -1,0 +1,193 @@
+name: TurboQuant+ SYCL CI/CD
+
+# Auto-compiles the TurboQuant SYCL build and publishes downloadable binaries.
+#  - push to the feature branch / manual dispatch -> build + upload artifacts (grab them
+#    from the run's "Artifacts" section, retained 90 days).
+#  - push a tag  tqp-sycl-v*  -> also publishes a permanent GitHub Release with the zips.
+on:
+  push:
+    branches:
+      - feature/turboquant-kv-cache
+    tags:
+      - 'tqp-sycl-v*'
+  workflow_dispatch:
+
+# Let a newer push cancel an in-flight run on the same ref (saves CI minutes).
+concurrency:
+  group: tqp-sycl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows SYCL package — the primary distributable (Intel Arc / Xe2 hardware).
+  # Self-contained: statically-linked llama binaries + bundled oneAPI runtime DLLs,
+  # so end users do NOT need oneAPI installed to run it.
+  # ---------------------------------------------------------------------------
+  windows-sycl:
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/24751ead-ddc5-4479-b9e6-f9fe2ff8b9f2/intel-deep-learning-essentials-2025.2.1.25_offline.exe
+      WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
+      ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: tqp-sycl-windows
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install oneAPI
+        run: |
+          scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          cmake -G "Ninja" -B build ^
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_SYCL=ON ^
+            -DLLAMA_CURL=OFF
+          cmake --build build --config Release -j ^
+            --target llama-cli llama-server llama-bench llama-quantize test-sycl-turbo
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+      - name: Bundle oneAPI runtime DLLs
+        run: |
+          echo "Copying oneAPI runtime DLLs from ${ONEAPI_ROOT} into ./build/bin"
+          cp "${ONEAPI_ROOT}/mkl/latest/bin/mkl_sycl_blas.5.dll"   ./build/bin
+          cp "${ONEAPI_ROOT}/mkl/latest/bin/mkl_core.2.dll"        ./build/bin
+          cp "${ONEAPI_ROOT}/mkl/latest/bin/mkl_tbb_thread.2.dll"  ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/ur_adapter_level_zero.dll"    ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/ur_adapter_level_zero_v2.dll" ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/ur_adapter_opencl.dll"        ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/ur_loader.dll"                ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/ur_win_proxy_loader.dll"      ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/sycl8.dll"                    ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/svml_dispmd.dll"              ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/libmmd.dll"                   ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/libiomp5md.dll"               ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/sycl-ls.exe"                  ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/libsycl-fallback-bfloat16.spv" ./build/bin
+          cp "${ONEAPI_ROOT}/compiler/latest/bin/libsycl-native-bfloat16.spv"   ./build/bin
+          cp "${ONEAPI_ROOT}/dnnl/latest/bin/dnnl.dll"    ./build/bin
+          cp "${ONEAPI_ROOT}/tbb/latest/bin/tbb12.dll"    ./build/bin
+          cp "${ONEAPI_ROOT}/tcm/latest/bin/tcm.dll"          ./build/bin
+          cp "${ONEAPI_ROOT}/tcm/latest/bin/libhwloc-15.dll"  ./build/bin
+          cp "${ONEAPI_ROOT}/umf/latest/bin/umf.dll"          ./build/bin
+          cp LICENSE ./build/bin/ || true
+
+      - name: Pack
+        run: |
+          7z a -snl turboquant-plus-sycl-windows-x64.zip ./build/bin/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: turboquant-plus-sycl-windows-x64
+          path: turboquant-plus-sycl-windows-x64.zip
+
+  # ---------------------------------------------------------------------------
+  # Linux SYCL compile gate — catches build regressions on the other toolchain
+  # (icx/icpx via apt). Uploads build/bin as a dev artifact; NOT a self-contained
+  # package (needs oneAPI runtime present at run time), so it is not a release asset.
+  # ---------------------------------------------------------------------------
+  linux-sycl:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: add oneAPI to apt
+        shell: bash
+        run: |
+          cd /tmp
+          wget https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo apt-key add GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          rm GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo add-apt-repository "deb https://apt.repos.intel.com/oneapi all main"
+
+      - name: install oneAPI dpcpp compiler + MKL
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel libssl-dev
+
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: tqp-sycl-linux
+          evict-old-files: 1d
+
+      - name: Build
+        run: |
+          source /opt/intel/oneapi/setvars.sh
+          cmake -B build \
+            -DGGML_NATIVE=OFF \
+            -DGGML_SYCL=ON \
+            -DCMAKE_C_COMPILER=icx \
+            -DCMAKE_CXX_COMPILER=icpx \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_CURL=OFF
+          cmake --build build --config Release -j $(nproc) \
+            --target llama-cli llama-server llama-bench llama-quantize test-sycl-turbo
+
+      - name: Pack (dev artifact — requires oneAPI runtime to run)
+        run: |
+          cp LICENSE ./build/bin/ || true
+          tar -czvf turboquant-plus-sycl-linux-x64.tar.gz -C ./build/bin .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: turboquant-plus-sycl-linux-x64
+          path: turboquant-plus-sycl-linux-x64.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Publish a GitHub Release with the Windows package (only on tqp-sycl-v* tags).
+  # Depends only on the Windows job so a Linux hiccup can't block the release.
+  # ---------------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/tqp-sycl-v')
+    needs: [windows-sycl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./release
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: TurboQuant+ SYCL ${{ github.ref_name }}
+          body: |
+            TurboQuant+ SYCL build for Intel GPUs (Arc / Xe2 tested on B580).
+
+            **turboquant-plus-sycl-windows-x64.zip** — self-contained Windows x64 package
+            (llama-cli, llama-server, llama-bench, llama-quantize + bundled oneAPI runtime
+            DLLs). Unzip and run; no oneAPI install required. Needs an Intel GPU driver.
+
+            KV-cache quant types: `turbo2_0` / `turbo3_0` / `turbo4_0` via `-ctk`/`-ctv`
+            (e.g. `-fa 1 -ctk turbo3_0 -ctv turbo3_0`) for 3.8–5.6x KV memory savings.
+          files: ./release/**/*
+          draft: false
+          prerelease: false
