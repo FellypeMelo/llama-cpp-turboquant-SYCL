@@ -474,7 +474,11 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
         float rel_mse = mse / (nr / D + 1e-20f);
         worst_cos = std::min(worst_cos, cosine);
         worst_relmse = std::max(worst_relmse, rel_mse);
-        bool col_ok = !(std::isnan(cosine) || std::isnan(rel_mse)) && cosine >= 0.999f && rel_mse <= 1e-3f;
+        // n_q > 2 (prefill) now routes through the dequant-to-f16 + f16 TILE path on device
+        // (fattn.cpp ggml_sycl_flash_attn_ext_turbo_prefill), so it carries f16 KV precision
+        // (~2^-9 rel error) rather than the higher-precision turbo VEC path used for n_q==1 decode.
+        const float relmse_tol = (n_q > 2) ? 6e-3f : 1e-3f;
+        bool col_ok = !(std::isnan(cosine) || std::isnan(rel_mse)) && cosine >= 0.999f && rel_mse <= relmse_tol;
         if (!col_ok) {
             pass = false;
             printf("  col %d FAILED cosine=%.6f rel-MSE=%.8f\n", c, cosine, rel_mse);
