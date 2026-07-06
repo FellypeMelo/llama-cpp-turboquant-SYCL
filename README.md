@@ -1,3 +1,48 @@
+# TurboQuant+ on SYCL — rotated low-bit KV cache for Intel GPUs
+
+[![TurboQuant+ SYCL CI/CD](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/actions/workflows/tqp-sycl.yml/badge.svg)](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/actions/workflows/tqp-sycl.yml)
+[![Release](https://img.shields.io/github/v/release/FellypeMelo/llama-cpp-turboquant-SYCL?include_prereleases&label=release)](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+> A `llama.cpp` fork that implements **TurboQuant** — 2/3/4-bit *rotated* KV-cache quantization — on the **SYCL backend for Intel GPUs** (Arc / Xe2). Up to **7.5× less KV-cache memory** than fp16, with **prefill at fp16 parity**, validated on an Intel Arc B580.
+
+**Why it matters:** for long-context inference the KV cache is the memory wall. fp16 KV for Qwen3-4B at 64k context is 9.2 GB — it alone nearly fills a 12 GB card. TurboQuant rotates each key/value vector with a Walsh–Hadamard transform (an orthogonal outlier-smoother) *before* quantizing it, so a tiny 2–4-bit codebook reconstructs it near-losslessly.
+
+### Headline results — Intel Arc B580, Qwen3-4B Q4_K_M
+
+| Metric | f16 | q8_0 | **turbo3** | **turbo2** |
+|--------|----:|-----:|-----------:|-----------:|
+| KV cache @ 64k ctx (MiB) | 9216 | 4896 | **1800** | **1632** |
+| Memory savings vs fp16 | 1× | 1.9× | **5.1×** | **5.6–7.5×** |
+| Prefill pp512 (t/s) | 1267 | 1271 | **1244** | ✓ parity |
+| Prefill pp8192 (t/s) | 580 | — | **577** | ✓ parity |
+| Decode tg128 @ d0 (t/s) | 75.6 | 71.8 | **70.4** | ✓ |
+
+fp16 @64k nearly OOMs the 12 GB card; turbo runs 64k with 6+ GB free (~256k context reachable). Prefill matches fp16 at every length. See the full picture — including the honest decode-at-depth limitation (inherent to *all* quantized KV, not turbo-specific) — in the deep-dive.
+
+### 📖 [Read the engineering deep-dive → `docs/TURBOQUANT_SYCL.md`](docs/TURBOQUANT_SYCL.md)
+The rotation math, the two attention paths, the six correctness bugs solved, the full benchmarks, and what was consciously deferred (XMX kernel, native D=64).
+
+### Quick start
+
+Download a pre-built self-contained package from the [**Releases page**](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/releases) (Windows x64 bundles the oneAPI runtime — no install needed), then:
+
+```bash
+# Turbo KV cache — requires flash-attention. Types: turbo2 / turbo3 / turbo4
+llama-server -m model.gguf -ngl 99 --flash-attn on \
+             --cache-type-k turbo3 --cache-type-v turbo3 -c 32768
+```
+
+On Intel GPUs, set `SYCL_CACHE_PERSISTENT=1` once so the SYCL JIT caches compiled kernels to disk (first launch compiles all kernels).
+
+**Build from source** (Windows, Intel oneAPI): `cmake -B build -G Ninja -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release`.
+
+---
+
+<sub>The unmodified upstream <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> README follows.</sub>
+
+---
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
