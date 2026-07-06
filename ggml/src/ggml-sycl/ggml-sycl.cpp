@@ -502,6 +502,13 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         stream->wait();
         sycl::free(tmp_tq4, *stream);
         tensor->type = GGML_TYPE_Q8_0;
+        // The stored data is now contiguous Q8_0; the tensor still carries TQ4_1S strides
+        // (nb[0]=20). Recompute contiguous Q8_0 strides so ggml_is_contiguous()/ggml_nbytes()
+        // are correct — otherwise mul_mat takes the strided-copy path and reads garbage -> NaN.
+        tensor->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+        tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(GGML_TYPE_Q8_0));
+        tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
+        tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
         return;
     }
 #ifndef _WIN32
