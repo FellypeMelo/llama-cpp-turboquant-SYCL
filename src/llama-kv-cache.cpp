@@ -1350,6 +1350,20 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+    // TurboQuant K stores WHT-rotated + quantized values. A RoPE K-shift would have to
+    // un-rotate -> RoPE -> re-rotate -> requantize, which is not implemented: build_rope_shift's
+    // `rot` is the attn_rot_k Hadamard (null when that feature is off, as it is for turbo) and the
+    // SYCL backend has neither a turbo->f32 cast nor an f32->turbo copy. Reporting "cannot shift"
+    // makes ctx_shift disable gracefully (common.cpp / server check can_shift) instead of the
+    // build_rope_shift null-`rot` dereference crashing the process. Turbo's memory savings let you
+    // set a large n_ctx instead of relying on context-shift.
+    for (const auto & layer : layers) {
+        if (layer.k && (layer.k->type == GGML_TYPE_TURBO2_0 ||
+                        layer.k->type == GGML_TYPE_TURBO3_0 ||
+                        layer.k->type == GGML_TYPE_TURBO4_0)) {
+            return false;
+        }
+    }
     return true;
 }
 
