@@ -104,10 +104,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
 
     constexpr int nthreads    = (ggml_sycl_fattn_vec_get_nthreads_device() > D ? ggml_sycl_fattn_vec_get_nthreads_device() : D);
-    // Turbo K: nthreads_KQ=1 so each lane holds the full (pre-rotated) Q vector in registers and
-    // scores one K-row alone. This mirrors the CUDA reference, keeps the turbo vec_dot's full-D
-    // Q_v reads in bounds (Q_reg is sized (D/2)/nthreads_KQ per lane), and drops the sub-group reduction.
-    constexpr int nthreads_KQ = K_is_turbo ? 1 : (type_K == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_KQ_q);
+    // Turbo K uses the same cooperative split as F16 (128/cpy_nb lanes per K-row): the turbo vec_dot
+    // now dequant+dots only its D/nthreads_KQ slice of the pre-rotated Q and the caller sub-group-
+    // reduces the partials. This shrinks Q_reg from the whole D (nthreads_KQ=1, which spilled the
+    // 128-GRF file and crushed occupancy at depth) to (D/2)/nthreads_KQ per lane -> many resident
+    // warps hide KV-read latency, fixing the long-context decode collapse.
+    constexpr int nthreads_KQ = (K_is_turbo || type_K == GGML_TYPE_F16) ? 128 / cpy_nb : nthreads_KQ_q;
     // Turbo V: 1/8th the V threads so V_cols_per_iter grows 8x (each lane dequantizes a whole block).
     constexpr int nthreads_V  = V_is_turbo ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8)
                                            : (type_V == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_V_q);
@@ -255,7 +257,8 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         for (int j = 0; j < ncols; ++j) {
             // Q arrives pre-rotated from the graph GGML_OP_TURBO_WHT node for turbo K, so it is
             // loaded straight into registers exactly like the non-turbo path (no inline rotation).
-            // With nthreads_KQ==1 for turbo, each lane fills the full Q_reg[j][0..D/2).
+            // Each lane fills its (D/2)/nthreads_KQ slice of Q_reg; the turbo vec_dot reads it back
+            // with the matching strided layout.
             const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j * nb01);
 #pragma unroll
             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {

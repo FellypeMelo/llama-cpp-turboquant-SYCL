@@ -304,21 +304,34 @@ static __dpct_inline__ float vec_dot_fattn_vec_KQ_turbo_generic(const char * __r
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
-    float sum = 0.0f;
+    // Cooperative across nthreads lanes (mirrors vec_dot_fattn_vec_KQ_f16): each lane dequantizes
+    // and dots only its D/nthreads slice of the pre-rotated Q (stored in Q_v as the same strided
+    // cpy_ne-block layout the non-turbo register load produces), and the caller sub-group-reduces
+    // the partials. This keeps Q_reg at (D/2)/nthreads per lane — vs the whole D at nthreads==1 —
+    // which is what lets many warps stay resident and hides KV-read latency at long context.
+    constexpr int cpy_nb = ggml_sycl_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
 
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int tid = item_ct1.get_local_id(2) % nthreads;
+    const int lane = item_ct1.get_local_id(2) % nthreads;
+
+    float sum = 0.0f;
 
 #pragma unroll
-    for (int i = tid; i < D; i += nthreads) {
-        float k = dequantize_fn(K_turbo, i, norm);
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int hi = k_KQ_0 + lane*cpy_ne + k_KQ_1;   // global half2 index into the D-vector
+            const float k0 = dequantize_fn(K_turbo, 2*hi,     norm);
+            const float k1 = dequantize_fn(K_turbo, 2*hi + 1, norm);
 #ifdef GGML_SYCL_F16
-        sycl::half q = ((const sycl::half *) Q_v)[i];
-        sum += k * (float)q;
+            const sycl::half2 q = ((const sycl::half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += k0 * (float) q.x() + k1 * (float) q.y();
 #else
-        float q = ((const float *) Q_v)[i];
-        sum += k * q;
+            const sycl::float2 q = ((const sycl::float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += k0 * q.x() + k1 * q.y();
 #endif
+        }
     }
 
     return sum;
