@@ -36,6 +36,14 @@
     FATTN_VEC_CASE(256, type_K, type_V)       \
     FATTN_VEC_CASE(512, type_K, type_V)       \
 
+// Turbo uses nthreads_KQ=1, so each lane holds the full pre-rotated Q in registers. On Intel
+// GPUs (128 GRF/thread in large-GRF mode) that fits for D<=128 but spills catastrophically at
+// D>=256 (the JIT build fails). Restrict turbo to D in {64,128} until the P2 cooperative-register
+// rework lands (CUDA gets D=256 for free only because its GPUs expose 255 regs/thread).
+#define FATTN_VEC_CASES_TURBO_D(type_K, type_V) \
+    FATTN_VEC_CASE( 64, type_K, type_V)         \
+    FATTN_VEC_CASE(128, type_K, type_V)         \
+
 static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -135,9 +143,9 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
     GGML_ABORT("Not match KV type in vec");
@@ -243,6 +251,19 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // Turbo KV is served EXCLUSIVELY by the vector kernel (matches the CUDA reference). The tile
+    // kernel cannot dequantize a turbo V cache (it is templated on type_K only and reads V as raw
+    // half2), so turbo must never route there. The vec kernel dequantizes both turbo K and V and
+    // consumes the graph-rotated Q. If the vector kernel cannot run (e.g. head_dim % 64 != 0),
+    // report NONE rather than falling back to the broken tile path.
+    const bool KV_is_turbo =
+        K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
+        V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    if (KV_is_turbo) {
+        // Turbo vec kernels only exist for D in {64,128} on SYCL (see FATTN_VEC_CASES_TURBO_D).
+        return (can_use_vector_kernel && K->ne[0] <= 128) ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
+
     // Todo: Use the XMX kernel if possible:
 
     // If there are no tensor cores available, use the generic tile kernel:
@@ -255,14 +276,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             }
         } else {
             if (Q->ne[1] <= 2) {
-                switch (K->type) {
-                    case GGML_TYPE_TURBO2_0:
-                    case GGML_TYPE_TURBO3_0:
-                    case GGML_TYPE_TURBO4_0:
-                        return BEST_FATTN_KERNEL_TILE;
-                    default:
-                        return BEST_FATTN_KERNEL_VEC;
-                }
+                return BEST_FATTN_KERNEL_VEC;
             }
         }
     }

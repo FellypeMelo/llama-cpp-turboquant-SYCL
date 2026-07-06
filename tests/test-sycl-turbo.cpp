@@ -7,6 +7,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 
 extern "C" {
     void quantize_row_turbo2_0_ref(const float * x, void * y, int64_t k);
@@ -22,6 +23,7 @@ extern "C" {
     void dequantize_row_tq4_1s(const void * x, float * y, int64_t k);
 
     void turbo_cpu_fwht(float * x, int group_size);
+    void turbo_cpu_fwht_inverse(float * x, int group_size);
 }
 
 static bool run_test(ggml_backend_t backend, ggml_type type, const char * name, 
@@ -320,6 +322,423 @@ static bool run_fattn_turbo_smoke_test(ggml_backend_t backend) {
     return pass;
 }
 
+// Round-trip identity check for GGML_OP_TURBO_WHT at the real KV group sizes (128 and 64):
+// forward then inverse must reconstruct the input (the +/-1 sign diagonals and (1/N)*H*H are
+// mutually inverse). Sign-table-free: does not need the 128/64 sign arrays exposed to the test,
+// unlike run_wht32_test which compares against a CPU reference. Catches a broken inverse or a
+// group-size/normalization mismatch in the SYCL WHT op.
+static bool run_wht_roundtrip_test(ggml_backend_t backend, int gs) {
+    printf("Testing GGML_OP_TURBO_WHT fwd->inv round-trip, group_size=%d on SYCL...\n", gs);
+
+    struct ggml_init_params params = { 4 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, gs);
+    struct ggml_tensor * fwd   = ggml_turbo_wht(ctx, input, /*direction=*/0, /*group_size=*/gs, /*scale=*/nullptr);
+    struct ggml_tensor * inv   = ggml_turbo_wht(ctx, fwd,   /*direction=*/1, /*group_size=*/gs, /*scale=*/nullptr);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> host_input(gs);
+    for (int i = 0; i < gs; i++) host_input[i] = sinf(i * 0.23f + 0.11f) * 2.0f - 0.5f;
+    ggml_backend_tensor_set(input, host_input.data(), 0, gs * sizeof(float));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, inv);
+    ggml_backend_graph_compute(backend, gf);
+
+    std::vector<float> sycl_out(gs);
+    ggml_backend_tensor_get(inv, sycl_out.data(), 0, gs * sizeof(float));
+
+    float mse = 0, maxabs = 0;
+    for (int i = 0; i < gs; i++) {
+        float diff = sycl_out[i] - host_input[i];
+        mse += diff * diff;
+        maxabs = std::max(maxabs, std::fabs(diff));
+    }
+    mse /= gs;
+    bool pass = !std::isnan(mse) && mse <= 1e-8f && maxabs <= 1e-3f;
+    printf("  MSE: %.10f, max|diff|: %.8f, %s\n", mse, maxabs, pass ? "PASSED" : "FAILED");
+    if (!pass) {
+        for (int i = 0; i < 8; i++) printf("    [%d] SYCL: %f, IN: %f\n", i, sycl_out[i], host_input[i]);
+    }
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
+// Value-level flash-attention parity oracle for turbo KV. Unlike run_fattn_turbo_smoke_test
+// (which builds FA with a RAW Q and only checks finiteness), this reproduces the real-model
+// data flow: the graph forward-WHT-rotates Q via GGML_OP_TURBO_WHT, then runs FA over a
+// turbo-quantized K/V cache. The CPU golden computes attention in the SAME rotated domain the
+// kernel works in (Qr = fwht(Q); scores against dequant(quant(K)); P.V against dequant(quant(V))),
+// so no output inverse-WHT is needed on either side.
+//
+// This test FAILS on the current code (the kernel ALSO rotates Q inline -> double rotation; and
+// the active TILE path reads turbo V as raw half2) and must PASS once the FA path converges on
+// the CUDA architecture (graph op = single rotation site, VEC kernel dequants V).
+static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type, const char * name,
+                                           void (*quant_ref)(const float *, void *, int64_t), int n_q) {
+    const int D      = 128;   // head dim == QK_TURBO block size
+    const int n_kv   = 256;   // multiple of FATTN_KQ_STRIDE
+    const float scale = 1.0f / sqrtf((float) D);
+    printf("Testing FA turbo golden parity: %s (D=%d, n_kv=%d, n_q=%d)...\n", name, D, n_kv, n_q);
+    // n_q>1 exercises the vec kernel's cols_per_block>=2 (prefill) path, which only turbo hits
+    // (non-turbo quantized prefill routes to the tile kernel). Quantize refs default the WHT group
+    // to 128 for a 128-aligned row, matching the head dim.
+
+    struct ggml_init_params params = { 64 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, 1, 1);
+    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, type, D, n_kv, 1, 1);
+    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, type, D, n_kv, 1, 1);
+
+    // Graph: rotate Q with the SAME forward WHT the real model inserts, then flash-attention.
+    struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/D, /*scale=*/nullptr);
+    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, /*mask=*/nullptr, scale, 0.0f, 0.0f);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> host_q(D * n_q);
+    for (int c = 0; c < n_q; c++)
+        for (int i = 0; i < D; i++) host_q[c*D + i] = sinf(i * 0.1f + 0.3f + c * 0.9f);
+    ggml_backend_tensor_set(q, host_q.data(), 0, host_q.size() * sizeof(float));
+
+    std::vector<float> host_kv(D * n_kv);
+    for (int i = 0; i < D * n_kv; i++) host_kv[i] = sinf(i * 0.05f + 0.7f) * 0.5f;
+
+    std::vector<char> quant_kv(ggml_nbytes(k));
+    quant_ref(host_kv.data(), quant_kv.data(), (int64_t) D * n_kv);
+    ggml_backend_tensor_set(k, quant_kv.data(), 0, quant_kv.size());
+    ggml_backend_tensor_set(v, quant_kv.data(), 0, quant_kv.size());
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        printf("  graph_compute FAILED with status %d\n", (int) status);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buffer);
+        return false;
+    }
+
+    std::vector<float> sycl_out(ggml_nelements(out));
+    ggml_backend_tensor_get(out, sycl_out.data(), 0, ggml_nbytes(out));
+
+    // --- CPU golden in the rotated domain ---
+    const size_t blk = ggml_type_size(type);
+    auto dequant_row = [&](int row, std::vector<float> & dst) {
+        const void * src = quant_kv.data() + (size_t) row * blk;
+        const ggml_type_traits * tr = ggml_get_type_traits(type);
+        tr->to_float(src, dst.data(), D);
+    };
+
+    // Device-rotated Q read back from the graph WHT node (n_q columns, each its own 128-group).
+    std::vector<float> qr_ref(D * n_q);
+    ggml_backend_tensor_get(qr, qr_ref.data(), 0, qr_ref.size() * sizeof(float));
+
+    // Pre-dequantize all K/V rows once.
+    std::vector<std::vector<float>> k_rows(n_kv, std::vector<float>(D)), v_rows(n_kv, std::vector<float>(D));
+    for (int j = 0; j < n_kv; j++) { dequant_row(j, k_rows[j]); dequant_row(j, v_rows[j]); }
+
+    // FA output layout is {DV, n_head=1, n_q}: column c output at sycl_out[c*D + d].
+    bool pass = true;
+    float worst_cos = 1.0f, worst_relmse = 0.0f;
+    std::vector<float> scores(n_kv), ref_out(D);
+    for (int c = 0; c < n_q; c++) {
+        const float * qc = qr_ref.data() + (size_t) c * D;
+        for (int j = 0; j < n_kv; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < D; d++) dot += qc[d] * k_rows[j][d];
+            scores[j] = dot * scale;
+        }
+        float mx = scores[0];
+        for (int j = 1; j < n_kv; j++) mx = std::max(mx, scores[j]);
+        float sum = 0.0f;
+        for (int j = 0; j < n_kv; j++) { scores[j] = expf(scores[j] - mx); sum += scores[j]; }
+        float inv_sum = 1.0f / sum;
+        std::fill(ref_out.begin(), ref_out.end(), 0.0f);
+        for (int j = 0; j < n_kv; j++) {
+            float p = scores[j] * inv_sum;
+            for (int d = 0; d < D; d++) ref_out[d] += p * v_rows[j][d];
+        }
+        const float * sc = sycl_out.data() + (size_t) c * D;
+        float mse = 0, cosv = 0, nr = 0, no = 0;
+        for (int d = 0; d < D; d++) {
+            float s = sc[d], r = ref_out[d];
+            mse += (s - r) * (s - r); cosv += s * r; nr += r * r; no += s * s;
+        }
+        float cosine = cosv / (sqrtf(nr) * sqrtf(no) + 1e-20f);
+        float rel_mse = mse / (nr / D + 1e-20f);
+        worst_cos = std::min(worst_cos, cosine);
+        worst_relmse = std::max(worst_relmse, rel_mse);
+        bool col_ok = !(std::isnan(cosine) || std::isnan(rel_mse)) && cosine >= 0.999f && rel_mse <= 1e-3f;
+        if (!col_ok) {
+            pass = false;
+            printf("  col %d FAILED cosine=%.6f rel-MSE=%.8f\n", c, cosine, rel_mse);
+            for (int d = 0; d < 6; d++) printf("    [%d] SYCL: %f, GOLDEN: %f\n", d, sc[d], ref_out[d]);
+        }
+    }
+    printf("  worst cosine: %.6f, worst rel-MSE: %.8f, %s\n", worst_cos, worst_relmse, pass ? "PASSED" : "FAILED");
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
+// BISECT TEST A: device inverse WHT (GGML_OP_TURBO_WHT direction=1) value parity vs CPU.
+// The real model applies this inverse to the FA output (llama-graph.cpp build_attn_mha) to undo
+// the V-side WHT rotation. The existing round-trip test only checks fwd(inv(x))==x; it can't catch
+// an inverse that is self-consistent but produces the WRONG un-rotated values. This compares the
+// device inverse of an arbitrary vector against the CPU reference turbo_cpu_fwht_inverse.
+static bool run_wht_inverse_value_test(ggml_backend_t backend, int gs) {
+    const int N = 4; // independent columns/groups
+    printf("Testing GGML_OP_TURBO_WHT inverse value parity, gs=%d...\n", gs);
+
+    struct ggml_init_params params = { 8 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gs, N);
+    struct ggml_tensor * inv   = ggml_turbo_wht(ctx, input, /*direction=*/1, /*group_size=*/gs, /*scale=*/nullptr);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> host(gs * N);
+    for (int i = 0; i < gs * N; i++) host[i] = sinf(i * 0.037f + 0.11f);
+    ggml_backend_tensor_set(input, host.data(), 0, host.size() * sizeof(float));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, inv);
+    ggml_backend_graph_compute(backend, gf);
+
+    std::vector<float> dev(gs * N);
+    ggml_backend_tensor_get(inv, dev.data(), 0, dev.size() * sizeof(float));
+
+    std::vector<float> ref = host;
+    for (int c = 0; c < N; c++) turbo_cpu_fwht_inverse(ref.data() + (size_t) c * gs, gs);
+
+    float maxdiff = 0.0f;
+    for (int i = 0; i < gs * N; i++) maxdiff = std::max(maxdiff, fabsf(dev[i] - ref[i]));
+    bool pass = !std::isnan(maxdiff) && maxdiff < 1e-4f;
+    printf("  max|dev-cpu| = %.8f  %s\n", maxdiff, pass ? "PASSED" : "FAILED");
+    if (!pass) for (int i = 0; i < 6; i++) printf("    [%d] dev=%f cpu=%f\n", i, dev[i], ref[i]);
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
+// BISECT TEST C: device SET_ROWS turbo quantize with MULTIPLE 128-groups per row and MULTIPLE rows.
+// The passing run_test only exercises a single 128-group / single row. The real KV cache stores
+// ne00 = n_head_kv*head_dim (folded heads => several 128-groups per row, e.g. 8 for Qwen3) and
+// writes n_tokens rows via indices. This reproduces that layout and compares device set_rows bytes
+// against the CPU quantize_row_turbo*_ref per row (each row quantized independently, group=128).
+static bool run_set_rows_multi_test(ggml_backend_t backend, ggml_type type, const char * name,
+                                    void (*quant_ref)(const float *, void *, int64_t),
+                                    void (*dequant_ref)(const void *, float *, int64_t),
+                                    int D, int n_rows) {
+    printf("Testing %s set_rows multi-group/multi-row (ne00=%d, rows=%d)...\n", name, D, n_rows);
+
+    struct ggml_init_params params = { 32 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * input   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows);
+    struct ggml_tensor * output  = ggml_new_tensor_2d(ctx, type, D, n_rows);
+    struct ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+    struct ggml_tensor * view    = ggml_set_rows(ctx, output, input, indices);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<float> host(D * n_rows);
+    for (int i = 0; i < D * n_rows; i++) host[i] = sinf(i * 0.05f + 0.7f) * 0.5f;
+    ggml_backend_tensor_set(input, host.data(), 0, host.size() * sizeof(float));
+
+    std::vector<int32_t> idx(n_rows);
+    for (int i = 0; i < n_rows; i++) idx[i] = i;
+    ggml_backend_tensor_set(indices, idx.data(), 0, n_rows * sizeof(int32_t));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, view);
+    ggml_backend_graph_compute(backend, gf);
+
+    std::vector<char> dev(ggml_nbytes(output));
+    ggml_backend_tensor_get(output, dev.data(), 0, dev.size());
+
+    const size_t row_bytes = ggml_nbytes(output) / n_rows;
+    std::vector<char> ref(ggml_nbytes(output));
+    for (int r = 0; r < n_rows; r++) quant_ref(host.data() + (size_t) r * D, ref.data() + (size_t) r * row_bytes, D);
+
+    bool pass = true;
+    float worst = 1.0f;
+    for (int r = 0; r < n_rows; r++) {
+        std::vector<float> ds(D), rs(D);
+        dequant_ref(dev.data() + (size_t) r * row_bytes, ds.data(), D);
+        dequant_ref(ref.data() + (size_t) r * row_bytes, rs.data(), D);
+        float cv = 0, ni = 0, no = 0;
+        for (int i = 0; i < D; i++) { cv += ds[i] * rs[i]; ni += rs[i] * rs[i]; no += ds[i] * ds[i]; }
+        float cos = cv / (sqrtf(ni) * sqrtf(no) + 1e-20f);
+        worst = std::min(worst, cos);
+        if (std::isnan(cos) || cos < 0.999f) {
+            pass = false;
+            printf("  row %d cosine=%.6f FAILED\n", r, cos);
+            for (int i = 0; i < 4; i++) printf("    [%d] dev=%f ref=%f\n", i, ds[i], rs[i]);
+        }
+    }
+    printf("  worst cosine=%.6f  %s\n", worst, pass ? "PASSED" : "FAILED");
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
+// BISECT TEST D: faithful DECODE reproduction — GQA (n_head > n_head_kv) + a PADDING MASK where the
+// KV cache is allocated to n_kv rows but only the first `seq_len` are valid; rows [seq_len, n_kv) are
+// padding whose K/V is uninitialized garbage and MUST be excluded via a -inf mask. This is exactly
+// the real-model generation path ("1111" degenerate output) that NO existing test exercises: the FA
+// golden has no mask, no GQA and no padding; q8_0 has mask+GQA but nthreads_KQ != 1 (turbo forces
+// nthreads_KQ=1). If the vec kernel mis-applies the mask to padding rows under nthreads_KQ=1, the
+// garbage padding K/V poisons the softmax and the output diverges from the CPU golden.
+static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type type, const char * name,
+                                            void (*quant_ref)(const float *, void *, int64_t)) {
+    const int D          = 128;
+    const int n_kv       = 256;   // allocated rows (multiple of FATTN_KQ_STRIDE)
+    const int seq_len    = 100;   // valid rows; [seq_len, n_kv) are padding -> masked out
+    const int n_head_kv  = 2;
+    const int gqa_ratio  = 4;
+    const int n_head     = n_head_kv * gqa_ratio; // 8 Q heads
+    const int n_tokens   = 1;     // decode
+    const float scale    = 1.0f / sqrtf((float) D);
+    printf("Testing FA turbo DECODE+GQA+padding-mask: %s (n_head=%d/%d, n_kv=%d, valid=%d)...\n",
+           name, n_head, n_head_kv, n_kv, seq_len);
+
+    struct ggml_init_params params = { 64 * 1024 * 1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_tokens, n_head, 1);
+    struct ggml_tensor * k    = ggml_new_tensor_4d(ctx, type, D, n_kv, n_head_kv, 1);
+    struct ggml_tensor * v    = ggml_new_tensor_4d(ctx, type, D, n_kv, n_head_kv, 1);
+    struct ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
+
+    struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/D, /*scale=*/nullptr);
+    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, mask, scale, 0.0f, 0.0f);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    // Q: one distinct vector per head.
+    std::vector<float> host_q(D * n_head);
+    for (int h = 0; h < n_head; h++)
+        for (int i = 0; i < D; i++) host_q[h*D + i] = sinf(i * 0.1f + 0.3f + h * 0.7f);
+    ggml_backend_tensor_set(q, host_q.data(), 0, host_q.size() * sizeof(float));
+
+    // K/V per kv-head: valid rows [0,seq_len) get smooth data; padding rows [seq_len,n_kv) get LARGE
+    // garbage (simulates uninitialized cache) so a mask failure produces a large, obvious divergence.
+    std::vector<float> host_k(D * n_kv * n_head_kv), host_v(D * n_kv * n_head_kv);
+    for (int hk = 0; hk < n_head_kv; hk++) {
+        for (int j = 0; j < n_kv; j++) {
+            for (int i = 0; i < D; i++) {
+                const size_t idx = ((size_t) hk * n_kv + j) * D + i;
+                if (j < seq_len) {
+                    host_k[idx] = sinf(i * 0.05f + j * 0.02f + hk * 0.5f + 0.7f) * 0.5f;
+                    host_v[idx] = cosf(i * 0.04f + j * 0.03f + hk * 0.3f + 0.2f) * 0.5f;
+                } else {
+                    host_k[idx] = 37.0f * sinf(i * 0.9f + j * 1.3f + 3.0f); // garbage
+                    host_v[idx] = 51.0f * cosf(i * 0.7f + j * 1.1f + 1.0f); // garbage
+                }
+            }
+        }
+    }
+
+    std::vector<char> qk(ggml_nbytes(k)), qv(ggml_nbytes(v));
+    // quantize per kv-head row-block (each row is D elements, one 128-group)
+    const size_t row_bytes = ggml_row_size(type, D);
+    for (int r = 0; r < n_kv * n_head_kv; r++) {
+        quant_ref(host_k.data() + (size_t) r * D, qk.data() + (size_t) r * row_bytes, D);
+        quant_ref(host_v.data() + (size_t) r * D, qv.data() + (size_t) r * row_bytes, D);
+    }
+    ggml_backend_tensor_set(k, qk.data(), 0, qk.size());
+    ggml_backend_tensor_set(v, qv.data(), 0, qv.size());
+
+    // Mask: 0 for valid rows, -inf for padding rows (same for the single decode token).
+    std::vector<uint16_t> host_mask(n_kv);
+    const uint16_t f16_zero = 0x0000;      // +0.0 in half
+    const uint16_t f16_ninf = 0xFC00;      // -inf in half
+    for (int j = 0; j < n_kv; j++) host_mask[j] = (j < seq_len) ? f16_zero : f16_ninf;
+    ggml_backend_tensor_set(mask, host_mask.data(), 0, host_mask.size() * sizeof(uint16_t));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        printf("  graph_compute FAILED with status %d\n", (int) status);
+        ggml_free(ctx); ggml_backend_buffer_free(buffer); return false;
+    }
+
+    std::vector<float> sycl_out(ggml_nelements(out));
+    ggml_backend_tensor_get(out, sycl_out.data(), 0, ggml_nbytes(out));
+
+    // Device-rotated Q read back (n_head columns, each its own 128-group).
+    std::vector<float> qr_ref(D * n_head);
+    ggml_backend_tensor_get(qr, qr_ref.data(), 0, qr_ref.size() * sizeof(float));
+
+    // Dequant K/V rows (rotated domain, same as kernel).
+    const ggml_type_traits * tr = ggml_get_type_traits(type);
+    std::vector<std::vector<float>> k_rows(n_kv * n_head_kv, std::vector<float>(D));
+    std::vector<std::vector<float>> v_rows(n_kv * n_head_kv, std::vector<float>(D));
+    for (int r = 0; r < n_kv * n_head_kv; r++) {
+        tr->to_float(qk.data() + (size_t) r * row_bytes, k_rows[r].data(), D);
+        tr->to_float(qv.data() + (size_t) r * row_bytes, v_rows[r].data(), D);
+    }
+
+    // FA output layout {D, n_head, n_tokens=1}: head h at sycl_out[h*D + d].
+    bool pass = true;
+    float worst_cos = 1.0f, worst_relmse = 0.0f;
+    std::vector<float> scores(seq_len), ref_out(D);
+    for (int h = 0; h < n_head; h++) {
+        const int hk = h / gqa_ratio;
+        const float * qh = qr_ref.data() + (size_t) h * D;
+        for (int j = 0; j < seq_len; j++) {           // ONLY valid rows (mask excludes the rest)
+            const float * krow = k_rows[(size_t) hk * n_kv + j].data();
+            float dot = 0.0f;
+            for (int d = 0; d < D; d++) dot += qh[d] * krow[d];
+            scores[j] = dot * scale;
+        }
+        float mx = scores[0];
+        for (int j = 1; j < seq_len; j++) mx = std::max(mx, scores[j]);
+        float sum = 0.0f;
+        for (int j = 0; j < seq_len; j++) { scores[j] = expf(scores[j] - mx); sum += scores[j]; }
+        float inv_sum = 1.0f / sum;
+        std::fill(ref_out.begin(), ref_out.end(), 0.0f);
+        for (int j = 0; j < seq_len; j++) {
+            const float * vrow = v_rows[(size_t) hk * n_kv + j].data();
+            float p = scores[j] * inv_sum;
+            for (int d = 0; d < D; d++) ref_out[d] += p * vrow[d];
+        }
+        const float * sc = sycl_out.data() + (size_t) h * D;
+        float mse = 0, cosv = 0, nr = 0, no = 0;
+        for (int d = 0; d < D; d++) {
+            float s = sc[d], r = ref_out[d];
+            mse += (s - r) * (s - r); cosv += s * r; nr += r * r; no += s * s;
+        }
+        float cosine = cosv / (sqrtf(nr) * sqrtf(no) + 1e-20f);
+        float rel_mse = mse / (nr / D + 1e-20f);
+        worst_cos = std::min(worst_cos, cosine);
+        worst_relmse = std::max(worst_relmse, rel_mse);
+        bool ok = !(std::isnan(cosine) || std::isnan(rel_mse)) && cosine >= 0.999f && rel_mse <= 1e-3f;
+        if (!ok) {
+            pass = false;
+            printf("  head %d (kv %d) FAILED cosine=%.6f rel-MSE=%.8f\n", h, hk, cosine, rel_mse);
+            for (int d = 0; d < 6; d++) printf("    [%d] SYCL: %f, GOLDEN: %f\n", d, sc[d], ref_out[d]);
+        }
+    }
+    printf("  worst cosine: %.6f, worst rel-MSE: %.8f, %s\n", worst_cos, worst_relmse, pass ? "PASSED" : "FAILED");
+
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    return pass;
+}
+
 int main() {
     // Structural assertions for TurboQuant block layouts (TDD validation)
     printf("Validating TurboQuant block layouts...\n");
@@ -366,6 +785,36 @@ int main() {
     success &= run_weight_test(backend, GGML_TYPE_TQ4_1S, "TQ4_1S", quantize_row_tq4_1s_ref, dequantize_row_tq4_1s);
 
     success &= run_wht32_test(backend);
+    success &= run_wht_roundtrip_test(backend, 128);
+    success &= run_wht_roundtrip_test(backend, 64);
+
+    // BISECT: the two turbo-only real-model pieces the FA golden never exercises.
+    printf("\n=== Bisect: inverse WHT value + multi-group set_rows ===\n");
+    success &= run_wht_inverse_value_test(backend, 128);
+    success &= run_wht_inverse_value_test(backend, 64);
+    // ne00=1024 == 8 groups (Qwen3 n_head_kv*head_dim); 4 token rows.
+    success &= run_set_rows_multi_test(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, dequantize_row_turbo3_0, 1024, 4);
+    success &= run_set_rows_multi_test(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, dequantize_row_turbo2_0, 1024, 4);
+    success &= run_set_rows_multi_test(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, dequantize_row_turbo4_0, 1024, 4);
+
+    // Value-level FA parity (the real oracle). Runs BEFORE the smoke test because the backend
+    // std::exit(1)s on any sycl::exception (ggml-sycl.cpp:4390), so the first failing FA call
+    // kills the process. EXPECTED on pre-convergence code: the turbo TILE path is selected and
+    // faults (OUT_OF_RESOURCES on Arc) / double-rotates; must PASS once turbo routes to VEC.
+    printf("\n=== FA turbo golden parity (value-level) ===\n");
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, 1);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, 1);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, 1);
+    // n_q>1 exercises the vec cols_per_block>=2 (prefill) path that only turbo uses:
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, 8);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, 8);
+
+    // DECODE reproduction: GQA + padding mask (the real "1111" generation path).
+    printf("\n=== FA turbo DECODE + GQA + padding-mask (real-model repro) ===\n");
+    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref);
+    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref);
+    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref);
+
     success &= run_fattn_turbo_smoke_test(backend);
 
     ggml_backend_free(backend);

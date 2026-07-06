@@ -929,7 +929,13 @@ static void flash_attn_tile(const char *  Q,
         }
     }
 
-    if constexpr (type_K) {
+    // Turbo Q pre-rotation was applied here for turbo K types. It was guarded by the bare
+    // `if constexpr (type_K)` which is TRUTHY for every non-F32 enum (GGML_TYPE_F16 == 1), so it
+    // wrongly rotated f16/q8_0 Q and corrupted all non-turbo flash-attention on the tile kernel.
+    // Turbo now routes exclusively to the vec kernel (see fattn.cpp) and Q is rotated by the graph
+    // GGML_OP_TURBO_WHT node, so no inline rotation belongs here. Guard restricted to turbo (dead
+    // for turbo since turbo never selects the tile kernel) to unbreak f16/q8_0.
+    if constexpr (type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0) {
         for (int jc = 0; jc < ncols; ++jc) {
             item_ct1.barrier(sycl::access::fence_space::local_space);
             dfloat val = 0.0f;
@@ -938,14 +944,14 @@ static void flash_attn_tile(const char *  Q,
                 if constexpr (DKQ == 64) val *= (dfloat)TURBO_WHT_SIGNS1_64[tid];
                 else                  val *= (dfloat)TURBO_WHT_SIGNS1[tid];
             }
-            
+
             turbo_wht<DKQ, dfloat, 32, 3>(val, item_ct1, (dfloat *)Q_tmp + jc * DKQ);
-            
+
             if (tid < DKQ) {
                 if constexpr (DKQ == 64) val *= (dfloat)TURBO_WHT_SIGNS2_64[tid];
                 else                  val *= (dfloat)TURBO_WHT_SIGNS2[tid];
                 val *= (dfloat)(1.0f / sqrtf((float)DKQ));
-                
+
                 ((dfloat *)Q_tmp)[jc * DKQ + tid] = val;
             }
         }

@@ -100,9 +100,17 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int nthreads_KQ_q = (D/4 < warp_size ? D/4 : warp_size);
     constexpr int nthreads_V_q  = (D/4 < warp_size ? D/4 : warp_size);
 
+    constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
+    constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
+
     constexpr int nthreads    = (ggml_sycl_fattn_vec_get_nthreads_device() > D ? ggml_sycl_fattn_vec_get_nthreads_device() : D);
-    constexpr int nthreads_KQ = type_K == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = type_V == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_V_q;
+    // Turbo K: nthreads_KQ=1 so each lane holds the full (pre-rotated) Q vector in registers and
+    // scores one K-row alone. This mirrors the CUDA reference, keeps the turbo vec_dot's full-D
+    // Q_v reads in bounds (Q_reg is sized (D/2)/nthreads_KQ per lane), and drops the sub-group reduction.
+    constexpr int nthreads_KQ = K_is_turbo ? 1 : (type_K == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_KQ_q);
+    // Turbo V: 1/8th the V threads so V_cols_per_iter grows 8x (each lane dequantizes a whole block).
+    constexpr int nthreads_V  = V_is_turbo ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8)
+                                           : (type_V == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_V_q);
 
     static_assert(warp_size % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(warp_size % nthreads_V  == 0, "bad nthreads_V");
@@ -111,7 +119,6 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int V_cols_per_iter   = warp_size / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, warp_size>();
-    constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
     constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && !K_is_turbo;
 #ifdef GGML_SYCL_F16
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, sycl::half, V_rows_per_thread>();
@@ -246,111 +253,46 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         const sycl::half2 scale_h2 = sycl::half2(scale, scale);
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            if constexpr (K_is_turbo) {
+            // Q arrives pre-rotated from the graph GGML_OP_TURBO_WHT node for turbo K, so it is
+            // loaded straight into registers exactly like the non-turbo path (no inline rotation).
+            // With nthreads_KQ==1 for turbo, each lane fills the full Q_reg[j][0..D/2).
+            const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j * nb01);
 #pragma unroll
-                for (int i = tid; i < D; i += nthreads) {
-                    float val = (ncols == 1 || ic0 + j < int(ne01.z())) ? ((const float *)(Q + j*nb01))[i] : 0.0f;
-                    if constexpr (D == 64) val *= TURBO_WHT_SIGNS1_64[i];
-                    else                  val *= TURBO_WHT_SIGNS1[i];
-                    KQ[j*D + i] = (dfloat)val;
-                }
-            } else {
-                const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j * nb01);
-#pragma unroll
-                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
-                    const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) :
-                                                                   item_ct1.get_local_id(2) % nthreads_KQ) *
-                                           cpy_ne;
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
+                const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) :
+                                                               item_ct1.get_local_id(2) % nthreads_KQ) *
+                                       cpy_ne;
 
-                    sycl::float2 tmp[cpy_ne] = {
-                        { 0.0f, 0.0f }
-                    };
-                    if (ncols == 1 || ic0 + j < int(ne01.z())) {
-                        ggml_sycl_memcpy_1<cpy_nb>(tmp,            &Q_j[i]);
-                        ggml_sycl_memcpy_1<cpy_nb>(tmp + cpy_ne/2, &Q_j[i + cpy_ne/2]);
-                    }
-#pragma unroll
-                    for (int i1 = 0; i1 < cpy_ne; ++i1) {
-                        Q_reg[j][i0 / nthreads_KQ + i1] = sycl::half2(tmp[i1].x(), tmp[i1].y()) * scale_h2;
-                    }
+                sycl::float2 tmp[cpy_ne] = {
+                    { 0.0f, 0.0f }
+                };
+                if (ncols == 1 || ic0 + j < int(ne01.z())) {
+                    ggml_sycl_memcpy_1<cpy_nb>(tmp,            &Q_j[i]);
+                    ggml_sycl_memcpy_1<cpy_nb>(tmp + cpy_ne/2, &Q_j[i + cpy_ne/2]);
                 }
-            }
-        }
-
-        if constexpr (K_is_turbo) {
-            item_ct1.barrier(sycl::access::fence_space::local_space);
-            for (int j = 0; j < ncols; ++j) {
-                if (tid < D) {
-                    dfloat val = KQ[j*D + tid];
-                    turbo_wht<D>(val, item_ct1, (dfloat*)KQ + j*D);
-                    if constexpr (D == 64) val *= (dfloat)TURBO_WHT_SIGNS2_64[tid];
-                    else                  val *= (dfloat)TURBO_WHT_SIGNS2[tid];
-                    val *= (dfloat)(1.0f / sqrtf((float)D));
-                    KQ[j*D + tid] = val;
-                }
-            }
-            item_ct1.barrier(sycl::access::fence_space::local_space);
-            for (int j = 0; j < ncols; ++j) {
-                const sycl::half2 * Q_rotated = (const sycl::half2 *) &KQ[j * D];
 #pragma unroll
-                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-                    const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) :
-                                                                   item_ct1.get_local_id(2) % nthreads_KQ);
-                    Q_reg[j][i0 / nthreads_KQ] = Q_rotated[i] * scale_h2;
+                for (int i1 = 0; i1 < cpy_ne; ++i1) {
+                    Q_reg[j][i0 / nthreads_KQ + i1] = sycl::half2(tmp[i1].x(), tmp[i1].y()) * scale_h2;
                 }
             }
         }
 #else
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            if constexpr (K_is_turbo) {
-                for (int i = tid; i < D; i += nthreads) {
-                    float val = (ncols == 1 || ic0 + j < int(ne01.z())) ? ((const float *)(Q + j*nb01))[i] : 0.0f;
-                    if constexpr (D == 64) val *= TURBO_WHT_SIGNS1_64[i];
-                    else                  val *= TURBO_WHT_SIGNS1[i];
-                    KQ[j*D + i] = (dfloat)val;
-                }
-            } else {
-                const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j*nb01);
+            // Q pre-rotated by the graph for turbo K: plain register load, no inline rotation.
+            const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j*nb01);
 #pragma unroll
-                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
-                    const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_KQ)*cpy_ne;
-                    if (ncols == 1 || ic0 + j < int(ne01.z())) {
-                        ggml_sycl_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ],            &Q_j[i]);
-                        ggml_sycl_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ + cpy_ne/2], &Q_j[i + cpy_ne/2]);
-                    }
-                }
-#pragma unroll
-                for (int k = 0; k < (D/2)/nthreads_KQ; ++k) {
-                    Q_reg[j][k].x() *= scale;
-                    Q_reg[j][k].y() *= scale;
+            for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
+                const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_KQ)*cpy_ne;
+                if (ncols == 1 || ic0 + j < int(ne01.z())) {
+                    ggml_sycl_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ],            &Q_j[i]);
+                    ggml_sycl_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ + cpy_ne/2], &Q_j[i + cpy_ne/2]);
                 }
             }
-        }
-
-        if constexpr (K_is_turbo) {
-            item_ct1.barrier(sycl::access::fence_space::local_space);
-            for (int j = 0; j < ncols; ++j) {
-                if (tid < D) {
-                    dfloat val = KQ[j*D + tid];
-                    turbo_wht<D>(val, item_ct1, (dfloat*)KQ + j*D);
-                    if constexpr (D == 64) val *= (dfloat)TURBO_WHT_SIGNS2_64[tid];
-                    else                  val *= (dfloat)TURBO_WHT_SIGNS2[tid];
-                    val *= (dfloat)(1.0f / sqrtf((float)D));
-                    KQ[j*D + tid] = val;
-                }
-            }
-            item_ct1.barrier(sycl::access::fence_space::local_space);
-            for (int j = 0; j < ncols; ++j) {
-                const sycl::float2 * Q_rotated = (const sycl::float2 *) &KQ[j * D];
 #pragma unroll
-                for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ) {
-                    const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) :
-                                                                   item_ct1.get_local_id(2) % nthreads_KQ);
-                    Q_reg[j][i0 / nthreads_KQ] = Q_rotated[i];
-                    Q_reg[j][i0 / nthreads_KQ].x() *= scale;
-                    Q_reg[j][i0 / nthreads_KQ].y() *= scale;
-                }
+            for (int k = 0; k < (D/2)/nthreads_KQ; ++k) {
+                Q_reg[j][k].x() *= scale;
+                Q_reg[j][k].y() *= scale;
             }
         }
 #endif // GGML_SYCL_F16
@@ -392,6 +334,14 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                     sum += slope * sycl::vec<sycl::half, 1>(maskh[j * ne11 + i_KQ])
                                        .convert<float, sycl::rounding_mode::automatic>()[0];
                 }
+
+                // The vec kernel iterates all ne11 KV rows, including padding rows beyond the valid
+                // sequence length whose K/V is uninitialized and can dequantize to NaN/Inf (this bit
+                // f16 and turbo alike on real models: an unmasked no-padding unit test never sees it).
+                // A NaN score survives the fmax below but then exp(NaN)=NaN poisons KQ_sum and the
+                // softmax weights. Invalid/masked positions must contribute exp(-inf)=0, so coerce a
+                // non-finite score to -inf here.
+                sum = sycl::isfinite(sum) ? sum : -INFINITY;
 
                 KQ_max_new[j] = sycl::fmax((float) KQ_max_new[j], sum);
 
@@ -457,6 +407,13 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                              2 * i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) :
                                                                       item_ct1.get_local_id(2) % nthreads_V) *
                                                V_rows_per_thread);
+                // Padding-row V can dequantize to NaN/Inf; a masked row has weight 0, but 0*NaN=NaN
+                // still poisons VKQ. Coerce non-finite V to 0 so invalid rows contribute nothing.
+#pragma unroll
+                for (int t = 0; t < V_rows_per_thread / 2; ++t) {
+                    if (!sycl::isfinite((float) tmp[t].x())) tmp[t].x() = sycl::half(0.0f);
+                    if (!sycl::isfinite((float) tmp[t].y())) tmp[t].y() = sycl::half(0.0f);
+                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -476,6 +433,13 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                 sycl::float2 tmp[V_rows_per_thread/2];
                 dequantize_V(V + k*nb21, tmp,
                     2*i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V)*V_rows_per_thread);
+                // Padding-row V can dequantize to NaN/Inf; a masked row has weight 0, but 0*NaN=NaN
+                // still poisons VKQ. Coerce non-finite V to 0 so invalid rows contribute nothing.
+#pragma unroll
+                for (int t = 0; t < V_rows_per_thread/2; ++t) {
+                    if (!sycl::isfinite(tmp[t].x())) tmp[t].x() = 0.0f;
+                    if (!sycl::isfinite(tmp[t].y())) tmp[t].y() = 0.0f;
+                }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll

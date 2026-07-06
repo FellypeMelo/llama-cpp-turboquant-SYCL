@@ -129,8 +129,12 @@ static void set_rows_sycl_turbo(
         queue_ptr stream) {
 
     const int64_t n_groups_per_row = ne00 / 128;
-    const int64_t n_indices = ne11; 
-    
+    // Number of rows to write == number of source rows (one dst index per src row).
+    // Was ne11 (src1->ne[1]), which is 1 for a 1-D [n_tokens] index tensor -> only the
+    // first row was ever quantized into the cache; every later token's turbo K/V stayed
+    // zeroed -> attention garbage -> degenerate repeated-token output.
+    const int64_t n_indices = ne01 * ne02 * ne03;
+
     const int64_t grid_size = n_indices * n_groups_per_row;
     const int block_size = 128;
 
