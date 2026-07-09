@@ -4,8 +4,15 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 
 ## Onde estamos
 
-- **Branch canônico:** `feature/turboquant-kv-cache` @ `5874b9fe1` — intacto, funcional (turbo2/3/4 KV cache validado em Arc B580, golden green, CI `tqp-sycl.yml` verde).
-- **Sync em andamento:** `sync/upstream-2026-07` @ `5874b9fe1` (LIMPO). Trial-merge de `upstream/master` (`fb30ba9a6`, 2026-07-09) feito e **analisado**; merge **abortado** de propósito (ADR-0002). Base velha `7fc1c4ef` (2026-04-21) → base nova `fb30ba9a6`. Fork 230 commits à frente; upstream 1075.
+- **Branch canônico:** `feature/turboquant-kv-cache` @ `5874b9fe1` — intacto, NÃO tocado neste sync.
+- **Sync CONCLUÍDO (SYCL):** `sync/upstream-2026-07` — `git merge upstream/master` (`fb30ba9a6`) feito,
+  os **31 conflitos resolvidos** re-integrando turbo, **build SYCL verde** e **golden gate `test-sycl-turbo`
+  verde (exit 0)** na Arc B580. Detalhes/evidência em `docs/UPSTREAM_SYNC.md` ("Resultado da execução")
+  e `QUALITY.md`. ADR-0003 = Opção A (enum turbo 43–47); ADR-0004 = `GGML_SYCL_FA_ALL_QUANTS` OFF.
+  **Merge commitado apenas com build+gate verdes; NÃO pushado.**
+  Pendências honestas (não bloqueiam SYCL): PPL/bench gate (falta modelo puro-atenção + wikitext local);
+  CUDA/Metal/Vulkan resolvidos mas não compilados (build SYCL-only); Vulkan turbo3 FA scalar/coopmat1
+  não-funcional pós-merge (CM2 preservado) — best-effort não-Arc.
 
 ## Sync upstream 2026-07 — resumo do estado
 
@@ -14,10 +21,10 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 | Arquivos em conflito | 31 (bounded, caracterizados em `UPSTREAM_SYNC.md`) |
 | Auto-merges silenciosos de risco | `ggml.c`, `ggml-common.h` (BAIXO), `llama-graph.cpp` (+912, MÉDIO), `dmmv.cpp` (+916, MÉDIO) |
 | Colisão dura | enum `ggml_type` slot 42 (Q2_0 vs turbo) → **decisão do dono pendente** (ADR-0003) |
-| Resolvidos | 0 (nenhuma resolução assada — sem build p/ validar) |
-| Pendentes | 31 + verificação semântica dos auto-merges |
-| Turbo preservado? | Textual: SIM provisório. Runtime: **PENDENTE** (sem build/golden) |
-| Gate build/teste | **PENDENTE** — toolchain SYCL não estava no PATH nesta sessão |
+| Resolvidos | **31 / 31** (turbo re-integrado sobre estrutura nova upstream) |
+| Pendentes | 0 conflitos. Auto-merges verificados por build (3 quebras silenciosas achadas+corrigidas) |
+| Turbo preservado? | **SIM — validado em runtime** (golden `test-sycl-turbo` exit 0, cosine ~1.0, Arc B580) |
+| Gate build/teste | **VERDE (SYCL)** — build exit 0 + golden gate exit 0. PPL/bench pendente (falta modelo ref local) |
 
 ## Cobertura de teste (registro exigido pela diretriz do dono)
 

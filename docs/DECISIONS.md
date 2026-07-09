@@ -52,10 +52,24 @@ Consequência: a resolução real (+ build + golden test) fica para a **próxima
 
 ---
 
-## ADR-0003 — Colisão de enum `ggml_type` no slot 42 (Q2_0 vs TurboQuant): decisão pendente do dono
+## ADR-0003 — Colisão de enum `ggml_type` no slot 42 (Q2_0 vs TurboQuant): RESOLVIDO Opção A
+
+**Data:** 2026-07-09 (aceito 2026-07-09, sessão de execução do sync)
+**Status:** **Aceito — Opção A** (dono confirmou: não há GGUF turbo salvos que precisem continuar carregáveis)
+
+### Decisão do dono
+Opção A escolhida. Alinhar com upstream: `Q2_0=42`, e mover os tipos turbo para 43–47:
+`TURBO2_0=43, TURBO3_0=44, TURBO4_0=45, TQ3_1S=46, TQ4_1S=47, GGML_TYPE_COUNT=48`.
+Motivo: não existem GGUFs quantizados como TQ3_1S/TQ4_1S em uso (path validado = pesos Q4_K_M + KV turbo runtime). Zero divergência permanente de numeração → syncs futuros não reconflitam Q2_0. Custo (mudança de ID de TQ3_1S/TQ4_1S) é inofensivo por não haver arquivos afetados.
+
+Aplicado em: `ggml/include/ggml.h`, `gguf-py/gguf/constants.py` (`GGMLQuantizationType` + block-size map), coerente com `ggml.c`/`ggml-common.h` (designated initializers por nome). `include/llama.h` / `LlamaFileType` = take-both (sem renumerar; 42 fica livre no ftype).
+
+---
+
+### Contexto (original)
 
 **Data:** 2026-07-09
-**Status:** Proposto (precisa confirmação do dono antes de finalizar o sync)
+**Status original:** Proposto (precisa confirmação do dono antes de finalizar o sync)
 
 ### Contexto
 Única colisão *dura* de numeração do sync:
@@ -81,3 +95,35 @@ Consequência: a resolução real (+ build + golden test) fica para a **próxima
 Qualquer que seja a escolha, **numeração precisa ficar idêntica** em: `ggml/include/ggml.h`, `gguf-py/gguf/constants.py` (`GGMLQuantizationType` + block-size map), e coerente com `ggml.c`. `include/llama.h` e `LlamaFileType` = take-both (sem renumerar).
 
 **Recomendação:** Opção A, salvo o dono confirmar que há GGUFs TQ em uso.
+
+---
+
+## ADR-0004 — `GGML_SYCL_FA_ALL_QUANTS` fica OFF no fork (link do FA turbo)
+
+**Data:** 2026-07-09 (sessão de execução do sync)
+**Status:** Aceito
+
+### Contexto
+Upstream passou a `#define GGML_SYCL_FA_ALL_QUANTS` por padrão em `ggml-sycl/common.hpp` (habilita
+todos os quant types no flash-attention SYCL). O fork nunca definiu esse macro — sua config validada
+usa o branch FA-vec `#else` (F16/Q4_0/Q8_0 + combos turbo curados).
+
+O macro ON ativa o branch que faz **odr-use** de `ggml_sycl_flash_attn_ext_vec_case<D, TURBO3_0, V>`
+para todo `V ∈ {F16,Q4_0,Q4_1,Q5_0,Q5_1,Q8_0}` e para `D ∈ {256,512}`. Esses combos têm `extern
+template` decl em `fattn-vec.hpp` (suprime instanciação implícita) mas SÓ existem 3 instâncias
+explícitas (`tq3-tq3`, `q8_0-tq3`, `tq3-q8_0`, em D=64/128 — turbo GRF-spilla em D≥256 no Intel,
+ver `FATTN_VEC_CASES_TURBO_D`). Resultado com o macro ON: **LNK2019 unresolved externals** no link
+de `ggml-sycl.dll`. (turbo2/turbo4 linkam por instanciação implícita — não têm extern decl.)
+
+### Decisão
+Manter `GGML_SYCL_FA_ALL_QUANTS` **desabilitado** (comentado, marcado `// TURBO BEGIN/END` em
+`common.hpp`). Restaura o path FA `#else` validado do fork.
+
+- **Custo:** FA SYCL cobre KV F16/Q4_0/Q8_0 (standard) + turbo2/3/4 — não Q4_1/Q5_0/Q5_1 standard.
+  O fork nunca suportou esses no FA (não é regressão vs baseline do fork).
+- **Divergência de upstream:** 1 linha, marcada e documentada (reconflita trivialmente em syncs futuros).
+- **Reverter (re-ligar ALL_QUANTS)** exige gerar a matriz completa de instâncias FA-vec turbo
+  (turbo × todos os tipos, D=64..512) — grande, e a maioria dos combos nunca ocorre em runtime
+  (turbo K só pareia com turbo V ou q8_0). Fora de escopo até haver necessidade real.
+
+**Evidência:** com o macro OFF, build SYCL linka (exit 0) e `test-sycl-turbo` passa verde na Arc B580.

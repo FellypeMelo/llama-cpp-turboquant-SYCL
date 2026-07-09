@@ -14,7 +14,7 @@
 | commits fork à frente | 230 |
 | commits upstream à frente | 1075 |
 | estratégia | **merge** (ADR-0001) |
-| estado geral | **PENDENTE** — trial-merge feito e analisado; resolução real + build não feita (ADR-0002) |
+| estado geral | **RESOLVIDO + VALIDADO (SYCL)** — 31 conflitos resolvidos, merge feito, build SYCL verde, golden gate verde. Ver "Resultado da execução" abaixo. |
 
 ## Como retomar (próxima sessão, COM toolchain oneAPI)
 
@@ -142,3 +142,71 @@ cmake --build build --config Release -j 8 --target llama-cli llama-server llama-
 Fixes conhecidos do shell do agente: PATH do vswhere (`...VisualStudio\Installer`), `set "NoDefaultCurrentDirectoryInExePath="`, `/EHsc`, rodar `.bat` via **PowerShell** `cmd /c`. Matar procs que seguram a DLL ggml-sycl antes de relinkar.
 
 Gate: `tests/test-sycl-turbo` (golden cosine ~0.99999) + `bash scripts/turbo-quality-gate.sh` (PPL turbo3 < 1.05× baseline, ratio velocidade > 0.95) + CI `.github/workflows/tqp-sycl.yml` verde.
+
+---
+
+## Resultado da execução (2026-07-09, sessão com toolchain)
+
+**Merge feito e resolvido.** `git merge upstream/master` (fb30ba9a6) sobre `sync/upstream-2026-07`.
+Os 31 conflitos foram resolvidos re-integrando a lógica turbo sobre a estrutura nova do upstream
+(NÃO theirs/ours cego). ADR-0003 = Opção A aplicada (Q2_0=42, turbo 43–47, COUNT=48).
+
+### Build SYCL — VERDE
+- Toolchain: oneAPI 2026.0 (icx/icpx), Ninja, Win10 SDK 10.0.26100. Recipe correto em `QUALITY.md`.
+- `cmake --build build-sync --target test-sycl-turbo llama-cli` → **exit 0**, `ggml-sycl.dll` (59 MB),
+  `test-sycl-turbo.exe`, `llama-cli.exe` linkados. 0 erros.
+- **3 quebras silenciosas de auto-merge que só o build pegou (corrigidas):**
+  1. `ggml.c` static_assert `GGML_OP_COUNT == 97` → **98** (op turbo `GGML_OP_TURBO_WHT` + ops novos upstream).
+  2. `ggml-sycl.cpp` chamava `get_sycl_env(...)` → upstream renomeou p/ `ggml_sycl_get_env(...)`.
+  3. **`GGML_SYCL_FA_ALL_QUANTS`**: upstream passou a `#define`-ar em `common.hpp` (fork tinha OFF).
+     Isso ativou o branch FA-vec que faz odr-use de `TURBO3_0 × {F16,Q4_0,Q4_1,Q5_0,Q5_1}` e
+     `TURBO3_0 @ D256/512` — combos com `extern template` decl mas SEM instância explícita (só existem
+     `tq3-tq3`, `q8_0-tq3`, `tq3-q8_0` @ D=64/128; turbo GRF-spilla @ D≥256 no Intel). → LNK2019.
+     **Fix:** manter `GGML_SYCL_FA_ALL_QUANTS` OFF (config validada do fork; restaura path FA `#else`
+     curado). Marcado `// TURBO BEGIN/END` em `common.hpp`. Custo: FA SYCL cobre F16/Q4_0/Q8_0 +
+     turbo (não Q4_1/Q5_0/Q5_1 standard — que o fork nunca suportou). Re-ligar ALL_QUANTS exige gerar
+     a matriz completa de instâncias turbo primeiro.
+
+### Gate turbo — VERDE (evidência real, Arc B580)
+`build-sync/bin/test-sycl-turbo.exe` sob oneAPI runtime → **exit 0**, todos PASSED:
+- TURBO2/3/4_0 quant: MSE 0.0, **cosine 1.000000**.
+- TQ3_1S weight mul: cosine 1.000000 · TQ4_1S: cosine 0.999843.
+- `GGML_OP_TURBO_WHT` fwd + fwd→inv round-trip (gs=32/64/128): PASSED, max|diff| ~3e-7.
+- Inverse-WHT value parity dev-vs-cpu (gs=64/128): max|dev-cpu| = 0.0.
+- set_rows multi-group TURBO2/3/4 (ne00=1024): cosine 1.000000.
+- FA turbo golden parity TURBO2/3/4 (D=128, n_q=1/8): cosine 0.999986–1.000000.
+- FA turbo DECODE+GQA+padding-mask TURBO2/3/4: cosine 1.000000.
+- Flash-Attention com KV cache TURBO3_0: graph_compute status 0, PASSED.
+
+### Pendências honestas
+- **`turbo-quality-gate.sh` (PPL fim-a-fim)**: NÃO rodado — o modelo validado (Qwen3-4B puro-atenção)
+  e o wikitext não estão presentes nesta máquina; o único .gguf local é híbrido (Gated Delta Net,
+  turbo não-validado nele por design). O golden `test-sycl-turbo` cobre paridade numérica turbo
+  (quant+WHT+FA+KV) diretamente na GPU. Rodar o PPL gate quando o modelo puro-atenção estiver disponível.
+- **Bench sem regressão >5%**: não medido nesta sessão (mesmo motivo — precisa do modelo de referência).
+- **CUDA/Metal/Vulkan**: resolvidos (0 markers) por sub-agentes, **não compilados** (build SYCL-only).
+  Vulkan: turbo3 FA nos paths scalar/coopmat1 ficou não-funcional pós-merge (upstream moveu o dequant
+  de FA p/ `flash_attn_dequant.glsl` novo, sem case TURBO3_0 — fora do escopo dos 4 arquivos do agente);
+  CM2 turbo3 preservado. Best-effort não-Arc; follow-up documentado.
+
+## Checklist de touch-points turbo inline (meta: `git merge upstream` futuro quase-zero conflito)
+
+Arquivos do upstream com hooks turbo inline (re-aplicar/conferir a cada sync). Marcados `// TURBO BEGIN/END`
+onde prático. `arquivo:símbolo` → o que preservar:
+
+| Arquivo | Símbolo / local | Hook turbo a preservar |
+|---|---|---|
+| `ggml/include/ggml.h` | `enum ggml_type` | slots 43–47 turbo (ADR-0003 A); realinhar se upstream ocupar 43+ |
+| `ggml/src/ggml.c` | `type_traits[]`, `GGML_OP_NAME/SYMBOL[]`, `static_assert(GGML_OP_COUNT==N)` | entries turbo + op TURBO_WHT; **bumpar o assert** |
+| `ggml/src/ggml-common.h` | `block_turbo2/3/4_0`, `block_tq3_1s/tq4_1s` | structs + static_asserts |
+| `gguf-py/gguf/constants.py` | `GGMLQuantizationType`, `LlamaFileType`, block-size map | espelhar numeração |
+| `include/llama.h` | `llama_ftype` | `MOSTLY_TQ3_1S=43/TQ4_1S=44` (take-both) |
+| `ggml/src/ggml-sycl/common.hpp` | `GGML_SYCL_FA_ALL_QUANTS` | manter **OFF** (senão LNK2019 turbo FA-vec) |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | `ggml_sycl_tq_convert_q8` (TQ_NATIVE), dmmv-exclusion, MUL_MAT TQ guard, SET_ROWS list, `GGML_OP_TURBO_WHT` dispatch+support | re-add nas listas/dispatch novos |
+| `ggml/src/ggml-sycl/{mmvq,cpy,convert,set_rows,dmmv}.cpp` | dispatch por tipo | cases turbo (take-both c/ tipos novos upstream) |
+| `ggml/src/ggml-sycl/fattn.cpp` | `ggml_sycl_flash_attn_ext_vec` (`#else` branch) | combos `FATTN_VEC_CASES_TURBO_D` (turbo×turbo, q8_0×turbo, turbo×q8_0 @ D64/128) |
+| `ggml/src/ggml-sycl/fattn-vec.hpp` | `EXTERN_DECL_FATTN_VEC_CASES(*, TURBO3_0)` | extern decls turbo3 |
+| `src/llama-kv-cache.cpp` | `ggml_mul_mat_aux`+InnerQ state, auto-asymmetric K, `+3` mem_size, rotation policy (`if(other)`/DeepSeek), adaptive-mode (`hparams.n_layer()`) | preservar; adaptar a renomes upstream |
+| `src/llama-context.cpp` | turbo K/V head-dim padding (2×) | usa `hparams.n_layer()` (era campo) |
+| `src/llama-graph.cpp` | `ggml_turbo_wht` fwd/inv, `get_turbo_innerq_scale_inv` | inverse-WHT no output FA (auto-merge; validar por build) |
+| `src/llama-model-loader.cpp` | `llama_ftype_name` | cases `TQ3_1S/TQ4_1S` no estilo prefix novo |
