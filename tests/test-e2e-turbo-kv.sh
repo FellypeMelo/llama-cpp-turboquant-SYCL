@@ -12,13 +12,18 @@
 # does generation come out coherent?"  -> asserts coherence on the GPU.
 #
 # GATED CONFIGS (coherent + SYCL-safe, from the 2026-07-09 B580 sweep):
-#   -ctk turbo3 -ctv turbo3   (uniform 3-bit; best balance, 5.1x KV saving)
-#   -ctk turbo4 -ctv turbo4   (uniform 4-bit; safest turbo, 3.8x)
-#   -ctk turbo2 -ctv turbo2   (2-bit + AUTO boundary-symmetric-q8_0 mode 8; 5.6x)
+#   SYMMETRIC (uniform turbo K and V):
+#     -ctk turbo3 -ctv turbo3   (uniform 3-bit; best balance, 5.1x KV saving)
+#     -ctk turbo4 -ctv turbo4   (uniform 4-bit; safest turbo, 3.8x)
+#     -ctk turbo2 -ctv turbo2   (2-bit + AUTO boundary-symmetric-q8_0 mode 8; 5.6x)
+#   ASYMMETRIC (precise K + turbo V; "V is free, K is everything"):
+#     -ctk q8_0 -ctv turbo{2,3,4}   (recommended prod default; K protected at 8-bit)
+#     -ctk f16  -ctv turbo{2,3,4}   (max-precision K; Q stays un-rotated when K is f16)
 # NOT gated (characterised in docs/BENCHMARKS.md):
 #   turbo2 with TURBO_LAYER_ADAPTIVE=0  -> degenerate repetition (needs boundary)
 #   TURBO_LAYER_ADAPTIVE=5/6/7          -> SYCL FA abort (mixed K/V turbo types)
 #   mixed turbo-K / q8_0-V              -> runs but flagged unreliable in code
+#   turbo-K + turbo-V asymmetric        -> NEVER (never enable turbo-K + turbo-V together)
 #
 # REQUIREMENTS: Intel Arc GPU + oneAPI runtime on PATH (source setvars.bat first)
 #   + the pure-attention reference model (Qwen3-4B). Absent model -> SKIP (77).
@@ -112,6 +117,12 @@ run_one() {
         FAIL=1; return
     fi
 
+    # (2b) no '?'-corruption: a broken KV dispatch emits runs of '?' replacement glyphs
+    local nq; nq=$(LC_ALL=C tr -cd '?' < "$gen" | wc -c)
+    if [ "${nq:-0}" -ge 10 ]; then
+        echo "  FAIL: output corruption ('?' appears ${nq}x)"; FAIL=1; return
+    fi
+
     # (3) not degenerate: max 5-gram frequency and unique-word ratio
     read -r maxg nwords ratio < <(
         LC_ALL=C tr 'A-Z' 'a-z' < "$gen" | LC_ALL=C tr -cs 'a-z0-9' ' ' | awk '
@@ -134,6 +145,16 @@ run_one() {
 run_one "turbo3" turbo3 turbo3
 run_one "turbo4" turbo4 turbo4
 run_one "turbo2" turbo2 turbo2
+
+# ASYMMETRIC precise-K + turbo-V ("V is free, K is everything"): K stays high-precision
+# (q8_0 recommended prod default, or f16 max-precision) while V is turbo-compressed. All six
+# {q8_0,f16} x {turbo2,turbo3,turbo4} combos dispatch on the SYCL vec kernel (head_dim=128).
+run_one "q8_0-turbo3" q8_0 turbo3
+run_one "q8_0-turbo2" q8_0 turbo2
+run_one "q8_0-turbo4" q8_0 turbo4
+run_one "f16-turbo3"  f16  turbo3
+run_one "f16-turbo2"  f16  turbo2
+run_one "f16-turbo4"  f16  turbo4
 
 echo ""
 echo "========================================"
