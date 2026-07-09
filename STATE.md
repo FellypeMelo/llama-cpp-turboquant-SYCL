@@ -31,6 +31,16 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
   `TURBO_LAYER_ADAPTIVE=5/6/7` ABORTAM (`fattn.cpp:166`, tipos K/V turbo mistos). Auto-assimétrica NÃO
   engaja p/ Qwen3-4B (GQA 4:1 < limiar 6) — correto.
 
+- **KV assimétrico (K preciso + V turbo) — FEITO (2026-07-09, Arc B580):** branch
+  `feature/asymmetric-turbo-kv`. Habilitado o dispatch `f16`-K + turbo-V no FA-vec SYCL (3 rows curadas
+  `FATTN_VEC_CASES_TURBO_D(F16, TURBO{2,3,4}_0)` + `fattn-vec-instance-f16-tq3.cpp`; `(F16,TURBO2/4_0)`
+  implícitas). `FA_ALL_QUANTS` continua OFF (ADR-0005). Antes do fix, `f16`-K abortava em `fattn.cpp:166`
+  (RED capturado). Golden `test-sycl-turbo` = **34 PASSED/0 FAIL**: `{q8_0,f16} x {turbo2,turbo3,turbo4}`
+  golden + DECODE/GQA/mask cosine 1.000000 (f16 rel-MSE 0.0, q8_0 ~8e-4). e2e `test-e2e-turbo-kv.sh`
+  estendido p/ as **6 assimétricas** (+ check anti-'?'): todas **COERENTES** na B580. Escopo: só G1+G5,
+  head_dim=128; NÃO tocado prefill-tile/kv-padding/MLA. **NÃO pushado.** Qwen2.5-7B PPL rescue = PENDENTE
+  (modelo ausente no disco; não baixado por instrução).
+
 ## Sync upstream 2026-07 — resumo do estado
 
 | Métrica | Valor |

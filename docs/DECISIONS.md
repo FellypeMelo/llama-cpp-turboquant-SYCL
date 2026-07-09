@@ -127,3 +127,41 @@ Manter `GGML_SYCL_FA_ALL_QUANTS` **desabilitado** (comentado, marcado `// TURBO 
   (turbo K só pareia com turbo V ou q8_0). Fora de escopo até haver necessidade real.
 
 **Evidência:** com o macro OFF, build SYCL linka (exit 0) e `test-sycl-turbo` passa verde na Arc B580.
+
+---
+
+## ADR-0005 — f16-K + turbo-V assimétrico: 3 rows curadas + 1 instance file (FA_ALL_QUANTS fica OFF)
+
+**Data:** 2026-07-09
+**Status:** Aceito
+**Branch:** `feature/asymmetric-turbo-kv` (de `feature/turboquant-kv-cache` @ `5602f58d0`)
+
+### Contexto
+Assimetria = K preciso (q8_0 ou f16) + V turbo ("V is free, K is everything"). O default de prod
+recomendado (`-ctk q8_0 -ctv turboN`) ja dispatcha no fork (rows `Q8_0 x TURBOx` em `fattn.cpp`). A
+config genuinamente NOVA e `f16`-K + turbo-V (K de precisao maxima, sem quant loss). O router
+(`ggml_sycl_get_best_fattn_kernel`) ja roteava esse par p/ `BEST_FATTN_KERNEL_VEC` (o gate `KV_is_turbo`
+so olha se ALGUM lado e turbo), mas o dispatch em `ggml_sycl_flash_attn_ext_vec` NAO tinha as rows
+`FATTN_VEC_CASES_TURBO_D(F16, TURBOx_0)` -> caia no `GGML_ABORT` "Not match KV type in vec"
+(`fattn.cpp:166`), abort alcancavel em runtime real, nao so assert defensivo.
+
+### Decisao
+Adicionar as 3 rows curadas `FATTN_VEC_CASES_TURBO_D(GGML_TYPE_F16, GGML_TYPE_TURBO{2,3,4}_0)` no bloco
+`#else` (marcadas `// TURBO BEGIN/END`), cap D em {64,128} como as outras rows turbo-V, mais UM arquivo
+de instancia `template-instances/fattn-vec-instance-f16-tq3.cpp` p/ o unico combo extern-declarado:
+`(F16, TURBO3_0)` em D=64/128 (espelha `q8_0-tq3.cpp`).
+
+- `(F16, TURBO2_0)` e `(F16, TURBO4_0)` sao instanciados IMPLICITAMENTE em `fattn.cpp` (turbo2/turbo4
+  nao aparecem no eixo type_V do `EXTERN_DECL_FATTN_VEC_CASES`) -> nenhum instance file necessario.
+- Semantica de rotacao ja correta no grafo: a Q-WHT forward gateia em `k->type` turbo e a inverse-WHT
+  gateia em `v->type` turbo (`llama-graph.cpp`), entao K=f16 deixa Q NAO-rotada enquanto V=turbo ainda
+  aplica a inverse-WHT na saida. Nenhuma edicao de grafo necessaria.
+- `GGML_SYCL_FA_ALL_QUANTS` continua **OFF** (ADR-0004). As rows novas NAO exigem religa-lo: so
+  precisam do 1 instance file curado; nao houve LNK2019 (build linka exit 0, DLL relinkada 60.3 MB).
+
+### Evidencia (Arc B580, build-sync)
+- Golden `test-sycl-turbo`: 34 PASSED / 0 FAIL. Assimetricas `{q8_0,f16} x {turbo2,turbo3,turbo4}`
+  golden decode + DECODE/GQA/padding-mask com cosine 1.000000 (f16 rel-MSE 0.0, q8_0 rel-MSE ~8e-4).
+  RED capturado antes do fix: `fattn.cpp:166 Not match KV type: K=f16 V=turbo3`.
+- e2e `test-e2e-turbo-kv.sh`: as 6 assimetricas geram texto COERENTE (keyword on-topic, sem repeticao
+  5-gram, sem abort/NaN, sem corrupcao '?').

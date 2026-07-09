@@ -68,13 +68,15 @@ Kill any llama-*/test-sycl-* procs before relinking (they hold `ggml-sycl.dll`).
    <setvars env> && set "SYCL_CACHE_PERSISTENT=1" && build-sync\bin\test-sycl-turbo.exe
    ```
    PASS = exit 0, all cases PASSED (quant cosine ~1.0, WHT fwd/inv round-trip, FA turbo parity,
-   FA DECODE+GQA+padding-mask, FA with TURBO3_0 KV cache). **Last run: exit 0, all PASSED.**
+   FA DECODE+GQA+padding-mask, FA with TURBO3_0 KV cache, plus ASYMMETRIC mixed-KV parity for
+   `{q8_0,f16} x {turbo2,turbo3,turbo4}` K/V). **Last run: exit 0, 34/34 PASSED.**
 
 2. **Turbo KV e2e COHERENCE gate (MANDATORY — needs the reference model + a GPU)** —
    `tests/test-e2e-turbo-kv.sh`, wired into ctest as `test-e2e-turbo-kv` (labels `e2e;gpu;turbo`).
-   Drives **real `llama-cli` generation** with turbo KV ON and asserts the recommended SYCL-safe configs
-   (`turbo3/turbo3`, `turbo4/turbo4`, `turbo2/turbo2`) produce **coherent** text (on-topic keyword +
-   no degenerate repetition + no abort/NaN). This is the direct proof that *"with turbo KV really on,
+   Drives **real `llama-cli` generation** with turbo KV ON and asserts the SYCL-safe configs -- the three
+   symmetric (`turbo3/turbo3`, `turbo4/turbo4`, `turbo2/turbo2`) plus the six ASYMMETRIC precise-K + turbo-V
+   (`{q8_0,f16} x {turbo2,turbo3,turbo4}`) -- produce **coherent** text (on-topic keyword + no degenerate
+   repetition + no abort/NaN + no '?'-corruption). This is the direct proof that *"with turbo KV really on,
    generation is coherent"* — the golden (gate 1) only proves kernel parity, not end-to-end generation.
    Run it (oneAPI env sourced first):
    ```
@@ -82,9 +84,9 @@ Kill any llama-*/test-sycl-* procs before relinking (they hold `ggml-sycl.dll`).
    # or standalone:  TURBO_E2E_MODEL=G:/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
    #                 bash tests/test-e2e-turbo-kv.sh
    ```
-   PASS = exit 0, all three configs COHERENT. **SKIPs (exit 77) when the model/llama-cli is absent**
+   PASS = exit 0, all configs COHERENT. **SKIPs (exit 77) when the model/llama-cli is absent**
    (e.g. on the model-less GitHub runners), so it is a no-op in `tqp-sycl.yml` and a real gate on the
-   **self-hosted Arc box**. **Last run: PASS on B580** (turbo3/turbo4/turbo2 all coherent, ~15 s).
+   **self-hosted Arc box**. **Last run: PASS on B580** (3 symmetric + 6 asymmetric all coherent).
    Full result matrix + samples in `docs/BENCHMARKS.md` ("matriz e2e de COERÊNCIA").
 
 3. **PPL quality + speed gate (needs the reference model + wikitext)** — `scripts/turbo-quality-gate.sh`
@@ -100,6 +102,11 @@ Best KV compression while staying coherent: **`-ctk turbo2 -ctv turbo2`** (auto 
 **5.65×** less KV VRAM. Safer default with a larger quality margin: **`-ctk turbo3 -ctv turbo3`** (5.12×).
 Both require `-fa on`. Avoid `TURBO_LAYER_ADAPTIVE=0` with turbo2 (degenerate repetition) and
 `TURBO_LAYER_ADAPTIVE=5/6/7` (SYCL FA abort). Accepted type strings: `turbo2`/`turbo3`/`turbo4`.
+
+ASYMMETRIC (K preciso + turbo V, "V is free, K is everything"): `-ctk q8_0 -ctv turbo3` is the
+quality-first prod default (K protected at 8-bit, 2.75x), and `-ctk f16 -ctv turboN` the max-precision-K
+mode (Q stays un-rotated). All six `{q8_0,f16} x {turbo2,turbo3,turbo4}` combos dispatch and are gated
+coherent (head_dim=128). NEVER enable turbo-K + turbo-V together.
 
 ## First-run note
 SYCL JIT-compiles all kernels on first launch (slow warmup). Set `SYCL_CACHE_PERSISTENT=1` so kernels

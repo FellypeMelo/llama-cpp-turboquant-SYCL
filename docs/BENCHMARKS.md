@@ -82,6 +82,40 @@ os 102 MiB reais > o nominal "51+51" turbo2 puro. `TURBO_LAYER_ADAPTIVE=0` desli
 particles in the atmosphere." repetido 3-4×, gramática "blue due because"). É o achado honesto: turbo2 puro
 uniforme degrada; a borda auto (mode 8) o resgata p/ coerente.
 
+### Matriz ASSIMÉTRICA — K preciso + V turbo (2026-07-09, Arc B580, build-sync JIT)
+
+Config assimétrica = K preciso (q8_0 ou f16) + V turbo ("V is free, K is everything"). O default de
+prod recomendado (`-ctk q8_0 -ctv turboN`) já dispatchava; a NOVA é `f16`-K + turbo-V (ver ADR-0005 e
+`fattn.cpp` rows `FATTN_VEC_CASES_TURBO_D(F16, TURBOx_0)`). head_dim=128. Golden parity provada em
+`test-sycl-turbo` (cosine 1.000000; f16 rel-MSE 0.0, q8_0 rel-MSE ~8e-4) e coerência e2e nas 6 configs.
+
+- **Golden (cosine / rel-MSE, decode n_q=1):** todas cosine **1.000000**. rel-MSE: `f16`-K = **0.0**
+  (dequant f16 bit-exato) ; `q8_0`-K = ~**8e-4** (arredondamento q8_0 device vs CPU). DECODE/GQA/mask:
+  idem (q8_0 rel-MSE ~8e-5, f16 0.0).
+- **KV @4k (MiB):** soma exata dos tamanhos por-lado já medidos na matriz simétrica acima
+  (`f16`=288, `q8_0`=153, `turbo4`=76.5, `turbo3`=56.25, `turbo2` puro=38.25 por lado).
+- **tok/s medido (build-sync JIT, `llama-bench` -p 512 -n 128 -r 2):** `q8_0/turbo3` pp512 **392.6**,
+  tg128 **69.9** ; `f16/turbo3` pp512 **415.8**, tg128 **70.3**. Decode ~70 t/s idêntico entre configs
+  (path vec compartilhado). São números build-sync JIT (piso); a **perf headline validada é a do
+  build-perf F16+AOT** (matriz simétrica: +102.8% prefill) -> re-medir AOT das assimétricas = PENDENTE.
+
+| `-ctk`/`-ctv` | KV @4k (MiB) | K / V (MiB) | compressão vs f16 | coerente? | abortou? | observação |
+|---|---|---|---|---|---|---|
+| `q8_0`/`turbo3` | 209.25 | 153 / 56.25 | 2.75× | **sim** | não | **default de prod recomendado** (K protegido 8-bit) |
+| `q8_0`/`turbo4` | 229.50 | 153 / 76.5 | 2.51× | **sim** | não | K q8_0 + V mais seguro |
+| `q8_0`/`turbo2` | 191.25 | 153 / 38.25 | 3.01× | **sim** | não | K q8_0 + V máx. compressão |
+| `f16`/`turbo3` | 344.25 | 288 / 56.25 | 1.67× | **sim** | não | **NOVO** — K precisão máx.; Q fica NÃO-rotada |
+| `f16`/`turbo4` | 364.50 | 288 / 76.5 | 1.58× | **sim** | não | **NOVO** — K f16 + V turbo4 |
+| `f16`/`turbo2` | 326.25 | 288 / 38.25 | 1.77× | **sim** | não | **NOVO** — K f16 + V turbo2 |
+
+\* Linhas `turbo2`-V assumem turbo2 puro por-lado (38.25 MiB). Se o auto boundary mode 8 do turbo2-V
+engajar também na assimétrica (como na simétrica turbo2-auto, lado ~51 MiB), o V-side real sobe -- não
+re-medido diretamente neste pass (o `llama-cli` em `-st` não imprime a linha `KV self size`). turbo3/
+turbo4-V não têm boundary -> VRAM exata. Coerência das 6 confirmada no e2e independente do valor de VRAM.
+
+Antes do fix, `f16`-K abortava em `fattn.cpp:166 Not match KV type in vec: K=f16 V=turbo3` (RED).
+NUNCA habilitar turbo-K + turbo-V juntos (assimetria = só UM lado turbo).
+
 ### Amostras reais (turbo KV ON)
 
 - **f16 (A, referência):** "The sky appears blue because molecules in the Earth's atmosphere scatter
