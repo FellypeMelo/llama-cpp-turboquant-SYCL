@@ -26,6 +26,17 @@ extern "C" {
     void turbo_cpu_fwht_inverse(float * x, int group_size);
 }
 
+// TURBO BEGIN - precise-K quant refs for asymmetric mixed-KV parity. K stays high-precision
+// (q8_0 or f16) while V is turbo-compressed; these wrap the public ggml-base quantizers so the
+// golden helper can quantize K and V by independent types (signature matches the turbo refs).
+static void quantize_row_q8_0_ref_wrap(const float * x, void * y, int64_t k) {
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, x, y, 0, 1, k, nullptr);
+}
+static void quantize_row_f16_ref_wrap(const float * x, void * y, int64_t k) {
+    ggml_fp32_to_fp16_row(x, (ggml_fp16_t *) y, k);
+}
+// TURBO END
+
 static bool run_test(ggml_backend_t backend, ggml_type type, const char * name, 
                     void (*quant_ref)(const float *, void *, int64_t),
                     void (*dequant_ref)(const void *, float *, int64_t)) {
@@ -378,8 +389,9 @@ static bool run_wht_roundtrip_test(ggml_backend_t backend, int gs) {
 // This test FAILS on the current code (the kernel ALSO rotates Q inline -> double rotation; and
 // the active TILE path reads turbo V as raw half2) and must PASS once the FA path converges on
 // the CUDA architecture (graph op = single rotation site, VEC kernel dequants V).
-static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type, const char * name,
-                                           void (*quant_ref)(const float *, void *, int64_t), int n_q) {
+static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type_K, ggml_type type_V, const char * name,
+                                           void (*quant_ref_K)(const float *, void *, int64_t),
+                                           void (*quant_ref_V)(const float *, void *, int64_t), int n_q) {
     const int D      = 128;   // head dim == QK_TURBO block size
     const int n_kv   = 256;   // multiple of FATTN_KQ_STRIDE
     const float scale = 1.0f / sqrtf((float) D);
@@ -392,8 +404,8 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     struct ggml_context * ctx = ggml_init(params);
 
     struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, 1, 1);
-    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, type, D, n_kv, 1, 1);
-    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, type, D, n_kv, 1, 1);
+    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, D, n_kv, 1, 1);
+    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, type_V, D, n_kv, 1, 1);
 
     // Graph: rotate Q with the SAME forward WHT the real model inserts, then flash-attention.
     struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/D, /*scale=*/nullptr);
@@ -409,10 +421,11 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     std::vector<float> host_kv(D * n_kv);
     for (int i = 0; i < D * n_kv; i++) host_kv[i] = sinf(i * 0.05f + 0.7f) * 0.5f;
 
-    std::vector<char> quant_kv(ggml_nbytes(k));
-    quant_ref(host_kv.data(), quant_kv.data(), (int64_t) D * n_kv);
-    ggml_backend_tensor_set(k, quant_kv.data(), 0, quant_kv.size());
-    ggml_backend_tensor_set(v, quant_kv.data(), 0, quant_kv.size());
+    std::vector<char> quant_k(ggml_nbytes(k)), quant_v(ggml_nbytes(v));
+    quant_ref_K(host_kv.data(), quant_k.data(), (int64_t) D * n_kv);
+    quant_ref_V(host_kv.data(), quant_v.data(), (int64_t) D * n_kv);
+    ggml_backend_tensor_set(k, quant_k.data(), 0, quant_k.size());
+    ggml_backend_tensor_set(v, quant_v.data(), 0, quant_v.size());
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
@@ -427,12 +440,16 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     std::vector<float> sycl_out(ggml_nelements(out));
     ggml_backend_tensor_get(out, sycl_out.data(), 0, ggml_nbytes(out));
 
-    // --- CPU golden in the rotated domain ---
-    const size_t blk = ggml_type_size(type);
-    auto dequant_row = [&](int row, std::vector<float> & dst) {
-        const void * src = quant_kv.data() + (size_t) row * blk;
-        const ggml_type_traits * tr = ggml_get_type_traits(type);
-        tr->to_float(src, dst.data(), D);
+    // --- CPU golden in the rotated domain (K and V dequant by independent types) ---
+    const size_t rb_k = ggml_row_size(type_K, D);
+    const size_t rb_v = ggml_row_size(type_V, D);
+    const ggml_type_traits * tr_k = ggml_get_type_traits(type_K);
+    const ggml_type_traits * tr_v = ggml_get_type_traits(type_V);
+    auto dequant_row_k = [&](int row, std::vector<float> & dst) {
+        tr_k->to_float(quant_k.data() + (size_t) row * rb_k, dst.data(), D);
+    };
+    auto dequant_row_v = [&](int row, std::vector<float> & dst) {
+        tr_v->to_float(quant_v.data() + (size_t) row * rb_v, dst.data(), D);
     };
 
     // Device-rotated Q read back from the graph WHT node (n_q columns, each its own 128-group).
@@ -441,7 +458,7 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
 
     // Pre-dequantize all K/V rows once.
     std::vector<std::vector<float>> k_rows(n_kv, std::vector<float>(D)), v_rows(n_kv, std::vector<float>(D));
-    for (int j = 0; j < n_kv; j++) { dequant_row(j, k_rows[j]); dequant_row(j, v_rows[j]); }
+    for (int j = 0; j < n_kv; j++) { dequant_row_k(j, k_rows[j]); dequant_row_v(j, v_rows[j]); }
 
     // FA output layout is {DV, n_head=1, n_q}: column c output at sycl_out[c*D + d].
     bool pass = true;
@@ -604,8 +621,9 @@ static bool run_set_rows_multi_test(ggml_backend_t backend, ggml_type type, cons
 // golden has no mask, no GQA and no padding; q8_0 has mask+GQA but nthreads_KQ != 1 (turbo forces
 // nthreads_KQ=1). If the vec kernel mis-applies the mask to padding rows under nthreads_KQ=1, the
 // garbage padding K/V poisons the softmax and the output diverges from the CPU golden.
-static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type type, const char * name,
-                                            void (*quant_ref)(const float *, void *, int64_t)) {
+static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type type_K, ggml_type type_V, const char * name,
+                                            void (*quant_ref_K)(const float *, void *, int64_t),
+                                            void (*quant_ref_V)(const float *, void *, int64_t)) {
     const int D          = 128;
     const int n_kv       = 256;   // allocated rows (multiple of FATTN_KQ_STRIDE)
     const int seq_len    = 100;   // valid rows; [seq_len, n_kv) are padding -> masked out
@@ -621,8 +639,8 @@ static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type ty
     struct ggml_context * ctx = ggml_init(params);
 
     struct ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_tokens, n_head, 1);
-    struct ggml_tensor * k    = ggml_new_tensor_4d(ctx, type, D, n_kv, n_head_kv, 1);
-    struct ggml_tensor * v    = ggml_new_tensor_4d(ctx, type, D, n_kv, n_head_kv, 1);
+    struct ggml_tensor * k    = ggml_new_tensor_4d(ctx, type_K, D, n_kv, n_head_kv, 1);
+    struct ggml_tensor * v    = ggml_new_tensor_4d(ctx, type_V, D, n_kv, n_head_kv, 1);
     struct ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
 
     struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/D, /*scale=*/nullptr);
@@ -656,10 +674,11 @@ static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type ty
 
     std::vector<char> qk(ggml_nbytes(k)), qv(ggml_nbytes(v));
     // quantize per kv-head row-block (each row is D elements, one 128-group)
-    const size_t row_bytes = ggml_row_size(type, D);
+    const size_t rb_k = ggml_row_size(type_K, D);
+    const size_t rb_v = ggml_row_size(type_V, D);
     for (int r = 0; r < n_kv * n_head_kv; r++) {
-        quant_ref(host_k.data() + (size_t) r * D, qk.data() + (size_t) r * row_bytes, D);
-        quant_ref(host_v.data() + (size_t) r * D, qv.data() + (size_t) r * row_bytes, D);
+        quant_ref_K(host_k.data() + (size_t) r * D, qk.data() + (size_t) r * rb_k, D);
+        quant_ref_V(host_v.data() + (size_t) r * D, qv.data() + (size_t) r * rb_v, D);
     }
     ggml_backend_tensor_set(k, qk.data(), 0, qk.size());
     ggml_backend_tensor_set(v, qv.data(), 0, qv.size());
@@ -686,13 +705,14 @@ static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type ty
     std::vector<float> qr_ref(D * n_head);
     ggml_backend_tensor_get(qr, qr_ref.data(), 0, qr_ref.size() * sizeof(float));
 
-    // Dequant K/V rows (rotated domain, same as kernel).
-    const ggml_type_traits * tr = ggml_get_type_traits(type);
+    // Dequant K/V rows (rotated domain, same as kernel; K and V by independent types).
+    const ggml_type_traits * tr_k = ggml_get_type_traits(type_K);
+    const ggml_type_traits * tr_v = ggml_get_type_traits(type_V);
     std::vector<std::vector<float>> k_rows(n_kv * n_head_kv, std::vector<float>(D));
     std::vector<std::vector<float>> v_rows(n_kv * n_head_kv, std::vector<float>(D));
     for (int r = 0; r < n_kv * n_head_kv; r++) {
-        tr->to_float(qk.data() + (size_t) r * row_bytes, k_rows[r].data(), D);
-        tr->to_float(qv.data() + (size_t) r * row_bytes, v_rows[r].data(), D);
+        tr_k->to_float(qk.data() + (size_t) r * rb_k, k_rows[r].data(), D);
+        tr_v->to_float(qv.data() + (size_t) r * rb_v, v_rows[r].data(), D);
     }
 
     // FA output layout {D, n_head, n_tokens=1}: head h at sycl_out[h*D + d].
@@ -806,18 +826,46 @@ int main() {
     // kills the process. EXPECTED on pre-convergence code: the turbo TILE path is selected and
     // faults (OUT_OF_RESOURCES on Arc) / double-rotates; must PASS once turbo routes to VEC.
     printf("\n=== FA turbo golden parity (value-level) ===\n");
-    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, 1);
-    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, 1);
-    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, 1);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref, 1);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, quantize_row_turbo2_0_ref, 1);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, quantize_row_turbo4_0_ref, 1);
     // n_q>1 exercises the vec cols_per_block>=2 (prefill) path that only turbo uses:
-    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, 8);
-    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, 8);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref, 8);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, quantize_row_turbo2_0_ref, 8);
 
     // DECODE reproduction: GQA + padding mask (the real "1111" generation path).
     printf("\n=== FA turbo DECODE + GQA + padding-mask (real-model repro) ===\n");
-    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref);
-    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref);
-    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref);
+    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref);
+    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, quantize_row_turbo2_0_ref);
+    success &= run_fattn_turbo_decode_mask_gqa(backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, quantize_row_turbo4_0_ref);
+
+    // TURBO BEGIN - ASYMMETRIC mixed-KV golden parity: precise K (q8_0 or f16) + turbo V.
+    // "V is free, K is everything": K stays high-precision, V is turbo-compressed. Pure kernel-vs-CPU
+    // parity oracle (both sides read the same graph-rotated Q and dequant K/V by independent types),
+    // so it validates the vec dispatch table for {q8_0,f16} x {turbo2,turbo3,turbo4} at head_dim=128.
+    // Quant error cancels between kernel and CPU golden, so even 2-bit turbo2-V holds cosine>=0.999.
+    struct asym_cfg {
+        ggml_type    type_K;
+        ggml_type    type_V;
+        const char * name;
+        void (*qref_K)(const float *, void *, int64_t);
+        void (*qref_V)(const float *, void *, int64_t);
+    };
+    const asym_cfg asym_cfgs[] = {
+        { GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0, "q8_0xTURBO2_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo2_0_ref },
+        { GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
+        { GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0, "q8_0xTURBO4_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo4_0_ref },
+        { GGML_TYPE_F16,  GGML_TYPE_TURBO3_0, "f16xTURBO3_0",  quantize_row_f16_ref_wrap,  quantize_row_turbo3_0_ref },
+        { GGML_TYPE_F16,  GGML_TYPE_TURBO2_0, "f16xTURBO2_0",  quantize_row_f16_ref_wrap,  quantize_row_turbo2_0_ref },
+        { GGML_TYPE_F16,  GGML_TYPE_TURBO4_0, "f16xTURBO4_0",  quantize_row_f16_ref_wrap,  quantize_row_turbo4_0_ref },
+    };
+    printf("\n=== FA turbo golden parity, ASYMMETRIC precise-K x turbo-V (decode n_q=1) ===\n");
+    for (const auto & c : asym_cfgs)
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1);
+    printf("\n=== FA turbo DECODE+GQA+padding-mask, ASYMMETRIC precise-K x turbo-V ===\n");
+    for (const auto & c : asym_cfgs)
+        success &= run_fattn_turbo_decode_mask_gqa(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V);
+    // TURBO END
 
     success &= run_fattn_turbo_smoke_test(backend);
 
