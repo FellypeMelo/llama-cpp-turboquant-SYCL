@@ -21,6 +21,15 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 - **PPL turbo-quality-gate AINDA PENDENTE:** o perf-pass mede tok/s, NÃO qualidade de tipo turbo.
   Qwen3-4B serve p/ velocidade mas NÃO p/ PPL turbo. Falta o modelo puro-atenção validado + `wikitext-2-raw`
   local p/ rodar `scripts/turbo-quality-gate.sh` (turbo3 PPL < 1.05x q8_0; ratio velocidade > 0.95 @4K).
+- **Turbo KV e2e COERÊNCIA — FEITO (2026-07-09, Arc B580):** prova de geração real ponta-a-ponta com turbo
+  KV ligado (não parity de kernel). Novo gate `tests/test-e2e-turbo-kv.sh` (ctest `test-e2e-turbo-kv`,
+  labels `e2e;gpu;turbo`, SKIP 77 sem modelo) — **VERDE** via ctest na B580 (~15 s). Matriz completa medida
+  (f16→turbo2) em `docs/BENCHMARKS.md`. **Veredito: turbo KV gera COERENTE** nas simétricas SYCL-safe
+  (`turbo3/turbo3` 5.12×, `turbo4/turbo4` 3.76×, `turbo2/turbo2` auto-mode-8 5.65×; decode ~74 t/s ≈ f16).
+  **Config ÓTIMA (máx. compressão coerente): `-ctk turbo2 -ctv turbo2`** (5.65× menos VRAM-KV); default
+  robusto `turbo3/turbo3`. Achados honestos: turbo2 uniforme (`TURBO_LAYER_ADAPTIVE=0`) DEGRADA (repetição);
+  `TURBO_LAYER_ADAPTIVE=5/6/7` ABORTAM (`fattn.cpp:166`, tipos K/V turbo mistos). Auto-assimétrica NÃO
+  engaja p/ Qwen3-4B (GQA 4:1 < limiar 6) — correto.
 
 ## Sync upstream 2026-07 — resumo do estado
 
@@ -40,6 +49,7 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 |---|---|---|
 | Unit / golden | `tests/test-sycl-turbo.cpp` (cosine ~0.99999, stress) | Existe; binário `build/bin/test-sycl-turbo.exe` já buildado no HEAD canônico. **Não re-rodado nesta sessão.** |
 | Unit quant | `tests/test-turbo-quant.c` | Existe. Não re-rodado. |
+| e2e / COERÊNCIA (turbo KV ON) | `tests/test-e2e-turbo-kv.sh` (ctest `test-e2e-turbo-kv`; keyword on-topic + anti-repetição + anti-abort nas configs turbo3/turbo4/turbo2) | **NOVO. VERDE na B580 via ctest (2026-07-09).** Prova geração real coerente com turbo KV ligado. SKIP 77 sem modelo. |
 | e2e / qualidade+velocidade | `scripts/turbo-quality-gate.sh` (PPL turbo3 < 1.05× baseline; ratio velocidade > 0.95 @4K) | Existe. Prova geração real fim-a-fim via `llama-perplexity`. **Não re-rodado.** |
 | CI/CD | `.github/workflows/tqp-sycl.yml` (windows-sycl + linux-sycl, artefatos + release em tag) | Existe, verde no HEAD canônico. **Não conflita no sync** (arquivo separado) → sobrevive. |
 

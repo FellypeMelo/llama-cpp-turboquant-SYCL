@@ -70,12 +70,36 @@ Kill any llama-*/test-sycl-* procs before relinking (they hold `ggml-sycl.dll`).
    PASS = exit 0, all cases PASSED (quant cosine ~1.0, WHT fwd/inv round-trip, FA turbo parity,
    FA DECODE+GQA+padding-mask, FA with TURBO3_0 KV cache). **Last run: exit 0, all PASSED.**
 
-2. **PPL quality + speed gate (needs the reference model + wikitext)** — `scripts/turbo-quality-gate.sh`
+2. **Turbo KV e2e COHERENCE gate (MANDATORY — needs the reference model + a GPU)** —
+   `tests/test-e2e-turbo-kv.sh`, wired into ctest as `test-e2e-turbo-kv` (labels `e2e;gpu;turbo`).
+   Drives **real `llama-cli` generation** with turbo KV ON and asserts the recommended SYCL-safe configs
+   (`turbo3/turbo3`, `turbo4/turbo4`, `turbo2/turbo2`) produce **coherent** text (on-topic keyword +
+   no degenerate repetition + no abort/NaN). This is the direct proof that *"with turbo KV really on,
+   generation is coherent"* — the golden (gate 1) only proves kernel parity, not end-to-end generation.
+   Run it (oneAPI env sourced first):
+   ```
+   <setvars env> && ctest --test-dir build-perf -R test-e2e-turbo-kv --output-on-failure
+   # or standalone:  TURBO_E2E_MODEL=G:/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+   #                 bash tests/test-e2e-turbo-kv.sh
+   ```
+   PASS = exit 0, all three configs COHERENT. **SKIPs (exit 77) when the model/llama-cli is absent**
+   (e.g. on the model-less GitHub runners), so it is a no-op in `tqp-sycl.yml` and a real gate on the
+   **self-hosted Arc box**. **Last run: PASS on B580** (turbo3/turbo4/turbo2 all coherent, ~15 s).
+   Full result matrix + samples in `docs/BENCHMARKS.md` ("matriz e2e de COERÊNCIA").
+
+3. **PPL quality + speed gate (needs the reference model + wikitext)** — `scripts/turbo-quality-gate.sh`
    (turbo3 PPL < 1.05× q8_0 baseline; turbo3/q8_0 speed ratio > 0.95 @ 4K). Requires the validated
    pure-attention model (Qwen3-4B) + `wikitext-2-raw`. Not runnable when only a hybrid model is present.
 
-3. **CI** — `.github/workflows/tqp-sycl.yml` (windows-sycl + linux-sycl), separate from upstream's
-   `build.yml` (which upstream deleted); survives the sync.
+4. **CI** — `.github/workflows/tqp-sycl.yml` (windows-sycl + linux-sycl), separate from upstream's
+   `build.yml` (which upstream deleted); survives the sync. (The e2e coherence gate SKIPs here — no GPU/model
+   on the hosted runners; run it on the self-hosted Arc machine.)
+
+### Recommended turbo KV config (measured 2026-07-09, Qwen3-4B, B580)
+Best KV compression while staying coherent: **`-ctk turbo2 -ctv turbo2`** (auto boundary mode 8) →
+**5.65×** less KV VRAM. Safer default with a larger quality margin: **`-ctk turbo3 -ctv turbo3`** (5.12×).
+Both require `-fa on`. Avoid `TURBO_LAYER_ADAPTIVE=0` with turbo2 (degenerate repetition) and
+`TURBO_LAYER_ADAPTIVE=5/6/7` (SYCL FA abort). Accepted type strings: `turbo2`/`turbo3`/`turbo4`.
 
 ## First-run note
 SYCL JIT-compiles all kernels on first launch (slow warmup). Set `SYCL_CACHE_PERSISTENT=1` so kernels

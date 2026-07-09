@@ -47,3 +47,70 @@ coberta pelo golden gate.
 - ggml-sycl.dll do build-perf tem ~247 MB pois embute TODOS os kernels AOT para bmg-g21. Link do AOT foi
   muito lento (~1h+ só no link, pela matriz de instâncias de flash-attention turbo). Trade-off: warmup JIT
   em runtime some, ao custo de build lento — normal para AOT no SYCL.
+
+## turbo KV-cache — matriz e2e de COERÊNCIA 2026-07-09 (Arc B580, build-perf F16+AOT)
+
+Responde a pergunta central do dono: **com o KV-cache turbo REALMENTE ligado, a geração sai coerente?**
+Não é parity de kernel (isso é o golden `test-sycl-turbo`, cosine ~1.0) — é **geração real ponta-a-ponta**
+via `llama-cli`. Prova nova, complementar ao golden.
+
+- **Modelo:** Qwen3-4B-Instruct-2507 Q4_K_M (pura-atenção, 36 camadas, `n_embd_head=128`).
+- **GQA:** `n_head=32`, `n_head_kv=8` → **ratio 4:1**. Abaixo do limiar 6 da lógica auto-assimétrica →
+  **auto-asimétrica NÃO engaja** (esperado e correto; o código nota "Mistral 4:1 → turbo3 K works fine").
+  Nenhuma linha `auto-asymmetric` no log p/ este modelo. (Só engajaria em modelo tipo Qwen2.5 7:1.)
+- **Comando:** `llama-cli -ngl 99 -fa on -c 4096 --temp 0 -n 150 -st` (greedy, determinístico), prompt
+  `"Explain why the sky is blue in 3 sentences."` (+ um prompt de raciocínio de conferência).
+- **VRAM-KV:** valor exato do log `llama_kv_cache: size = ...` (inclui zero-padding turbo do head_dim).
+- **Nomes de tipo aceitos por `-ctk`/`-ctv`:** `turbo2`, `turbo3`, `turbo4` (NÃO `turboN_0`).
+
+| `-ctk`/`-ctv` | KV @4k (MiB) | K / V (MiB) | compressão vs f16 | gen tok/s | pp tok/s | coerente? | abortou? | observação |
+|---|---|---|---|---|---|---|---|---|
+| `f16`/`f16` (default) | 576.00 | 288 / 288 | 1.00× | 77.4 | 204 | **sim** (referência) | não | baseline |
+| `q8_0`/`q8_0` | 306.00 | 153 / 153 | 1.88× | 73.4 | 72 | **sim** (≈ f16) | não | quant quase-lossless |
+| `q4_0`/`q4_0` | 162.00 | 81 / 81 | 3.56× | 73.6 | 71 | **sim** | não | |
+| `turbo4`/`turbo4` | 153.00 | 76.5 / 76.5 | 3.76× | 73.6 | 70 | **sim** | não | turbo mais seguro |
+| `turbo3`/`turbo3` | 112.50 | 56.25 / 56.25 | **5.12×** | 74.8 | 77 | **sim** | não | **default recomendado (melhor equilíbrio)** |
+| `turbo2`/`turbo2` (auto) | 102.00 | 51 / 51* | **5.65×** | 74.2 | 69 | **sim** | não | mode 8 auto (bordas q8_0); **maior compressão coerente** |
+| `turbo2`/`turbo2` `TURBO_LAYER_ADAPTIVE=0` | 76.50 | 38.25 / 38.25 | 7.53× | 70.6 | 76 | **NÃO — repetição degenerada** | não | 2-bit uniforme; mostra POR QUE a borda auto existe |
+| `turbo3`-K / `q8_0`-V (misto) | 209.25 | 56.25 / 153 | 2.75× | 73.8 | 199 | sim (neste run) | não | K=turbo/V=q8_0 marcado **não-confiável** no código → NÃO gated |
+| `turbo2`/`turbo2` `TURBO_LAYER_ADAPTIVE=5` | 80.75 | 38.25 / 42.5 | — | — | — | — | **SIM (abort)** | `fattn.cpp:166 Not match KV type: K=turbo2 V=turbo4` — misto SYCL-inseguro |
+
+\* `turbo2` (auto) = **mode 8 boundary-symmetric-q8_0** engaja sozinho (log: `Boundary symmetric q8_0
+auto-enabled for turbo2-V`): 1as-2 + últimas-2 camadas K+V=q8_0, 32 camadas do meio K+V=turbo2. Por isso
+os 102 MiB reais > o nominal "51+51" turbo2 puro. `TURBO_LAYER_ADAPTIVE=0` desliga a borda → turbo2 puro
+2-bit → **degenera** (loop de repetição "…due to Rayleigh scattering of sunlight by molecules and small
+particles in the atmosphere." repetido 3-4×, gramática "blue due because"). É o achado honesto: turbo2 puro
+uniforme degrada; a borda auto (mode 8) o resgata p/ coerente.
+
+### Amostras reais (turbo KV ON)
+
+- **f16 (A, referência):** "The sky appears blue because molecules in the Earth's atmosphere scatter
+  sunlight. Shorter wavelengths of light, like blue and violet, are scattered more than longer wavelengths
+  such as red and yellow. Although violet light is scattered even more than blue, our eyes are more
+  sensitive to blue…"
+- **turbo3 (B, headline):** "The sky appears blue because molecules in the atmosphere scatter shorter
+  wavelengths of sunlight more effectively than longer wavelengths. Blue light … is scattered more than
+  other colors because it has a shorter wavelength. This scattering, known as Rayleigh scattering, spreads
+  the blue light in all directions, making the sky appear blue during the day." → **coerente e correto**.
+- **turbo2 (auto mode 8):** "The sky is blue because molecules in the atmosphere scatter shorter wavelengths
+  of light (like blue) more than longer wavelengths (like red). This scattering spreads the blue light in
+  all directions, making the sky appear blue during the day…" → **coerente**.
+- **turbo2 uniforme (`TURBO_LAYER_ADAPTIVE=0`, DEGRADADO):** "…The blue color of the sky is due to Rayleigh
+  scattering of sunlight by molecules and small particles in the atmosphere. The blue sky is due to Rayleigh
+  scattering of sunlight by molecules and small particles in the atmosphere. The blue color of the sky is
+  due to Rayleigh scattering of." → **loop degenerado, NÃO usar**.
+- **Prompt de raciocínio** (60 km em 45 min → km/h): f16, turbo3 e turbo2-auto produziram setup
+  passo-a-passo correto (converter 45 min → 0,75 h; velocidade = dist/tempo) — coerentes nos 150 tokens.
+
+### Veredito e config ÓTIMA
+
+- **Sim, o turbo KV gera coerente** — para as configs **simétricas SYCL-safe**: `turbo3/turbo3`,
+  `turbo4/turbo4` e `turbo2/turbo2` (com a borda auto mode 8). Decode ~74 t/s (≈ f16 77 t/s, −4%).
+- **Config ÓTIMA (melhor compressão mantendo coerência):** **`-ctk turbo2 -ctv turbo2`** (auto mode 8) →
+  **5.65× menos VRAM de KV**, coerente. Se quiser margem de qualidade maior por ~10% menos economia, o
+  **default recomendado é `-ctk turbo3 -ctv turbo3`** (5.12×, uniforme, sem depender da borda).
+- **Depende do modo:** turbo2 **uniforme** (`TURBO_LAYER_ADAPTIVE=0`) degrada (repetição) — evitar.
+  `TURBO_LAYER_ADAPTIVE=5/6/7` (bordas com tipos turbo mistos) **abortam** no FA-vec SYCL
+  (`fattn.cpp:166`). Misto turbo-K/q8_0-V roda mas é marcado não-confiável no código — não recomendado.
+- **Gate e2e:** `tests/test-e2e-turbo-kv.sh` (via ctest `test-e2e-turbo-kv`) trava essas 3 configs
+  recomendadas e afirma coerência (keyword on-topic + sem repetição degenerada + sem abort). Verde na B580.

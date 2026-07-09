@@ -226,6 +226,33 @@ if (GGML_SYCL)
         target_compile_options(${sycl_test_target} PRIVATE "-fsycl")
         target_link_options(${sycl_test_target} PRIVATE "-fsycl")
     endforeach()
+
+    # End-to-end turbo KV-cache COHERENCE gate — drives real llama-cli generation on
+    # the GPU (not kernel parity) and asserts the recommended turbo KV configs
+    # (turbo3/turbo4/turbo2) produce coherent text (on-topic keyword + no degenerate
+    # repetition + no abort). This is the mandatory GPU gate for "turbo KV really ON".
+    # It is a script, not a compiled target, so it is NOT in SYCL_TEST_TARGETS.
+    # SKIPs (exit 77) when llama-cli or the reference model is absent — a no-op on the
+    # model-less CI runners, a real gate on the self-hosted Arc box (set TURBO_E2E_MODEL).
+    # Prefer Git-for-Windows bash; avoid C:/Windows/System32/bash.exe (the WSL launcher,
+    # whose /bin/bash is absent unless a distro is installed). On Linux this falls through
+    # to the PATH bash.
+    find_program(E2E_BASH NAMES bash
+                 HINTS "$ENV{ProgramFiles}/Git/bin" "$ENV{ProgramW6432}/Git/bin"
+                       "C:/Program Files/Git/bin" "C:/Program Files/Git/usr/bin"
+                 NO_DEFAULT_PATH)
+    if (NOT E2E_BASH)
+        find_program(E2E_BASH NAMES bash)
+    endif()
+    if (E2E_BASH)
+        add_test(NAME test-e2e-turbo-kv
+                 COMMAND ${E2E_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/test-e2e-turbo-kv.sh
+                 WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(test-e2e-turbo-kv PROPERTIES
+                 SKIP_RETURN_CODE 77
+                 LABELS "e2e;gpu;turbo"
+                 TIMEOUT 600)
+    endif()
 endif()
 llama_build_and_test(
     test-peg-parser.cpp
