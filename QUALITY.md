@@ -25,7 +25,28 @@ Extra PATH entries added inside cmd (setvars does not add them here):
 - Ninja: `...\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja` (ships with VS).
 - Win10 SDK bin (rc.exe/mt.exe): `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64`.
 
-### Configure
+### Configure (RECOMENDADO — perf build oficial p/ Arc B580 / Xe2)
+Medido em 2026-07-09: estas flags dobram o prefill (pp512 +102.8%, 2.03x) e mantêm decode flat (-3.3%,
+ruído), com golden `test-sycl-turbo` VERDE (22/22) e saída coerente. Ver `docs/BENCHMARKS.md`.
+```
+cmake -S . -B build-perf -G Ninja -DGGML_SYCL=ON \
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx \
+  -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON \
+  -DGGML_SYCL_F16=ON -DGGML_SYCL_DNN=ON -DGGML_SYCL_DEVICE_ARCH=bmg-g21
+```
+- `GGML_SYCL_F16=ON` — matmul FP16 no XMX Xe2 (fonte do ganho de prefill).
+- `GGML_SYCL_DEVICE_ARCH=bmg-g21` — AOT via `spir64_gen`, mata o warmup JIT no runtime. **Atenção: use o
+  hífen `bmg-g21`** (forma que o ocloc 2026.0 espera); o underscore `bmg_g21` é o seletor
+  `-fsycl-targets=intel_gpu_bmg_g21`, mecanismo diferente, e NÃO funciona por este caminho do CMake.
+  Trade-off: o link AOT é muito lento (~1h+) e o `ggml-sycl.dll` fica ~247 MB.
+- `GGML_SYCL_DNN=ON` — oneDNN ligado.
+
+> **Ressalva Xe2:** as flags F16/AOT ativam caminhos numéricos mais agressivos. São seguras **nesta GPU**
+> (golden verde + saída coerente na B580), mas **re-rodar o golden gate é obrigatório** em qualquer outra
+> arch/toolchain antes de confiar nelas. Se o golden falhar ou o build AOT lento incomodar, o fallback é
+> F16-only sem AOT (link rápido, paga JIT no 1o run) ou o baseline abaixo.
+
+### Configure (baseline / fallback — sem flags de perf)
 ```
 cmake -S . -B build-sync -G Ninja -DGGML_SYCL=ON \
   -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx \

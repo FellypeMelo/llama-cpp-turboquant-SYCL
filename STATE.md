@@ -13,6 +13,14 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
   Pendências honestas (não bloqueiam SYCL): PPL/bench gate (falta modelo puro-atenção + wikitext local);
   CUDA/Metal/Vulkan resolvidos mas não compilados (build SYCL-only); Vulkan turbo3 FA scalar/coopmat1
   não-funcional pós-merge (CM2 preservado) — best-effort não-Arc.
+- **Perf-pass CONCLUÍDO (2026-07-09, Arc B580):** build-perf com F16+AOT+DNN (ver `QUALITY.md`).
+  Golden `test-sycl-turbo` VERDE (22/22, cosine ~1.0) — flags de perf NÃO corrompem o turbo no Xe2.
+  Bench (Qwen3-4B Q4_K_M): **prefill +102.8% (2.03x)**, decode -3.3% (ruído). Saída coerente. Números
+  medidos em `docs/BENCHMARKS.md`. As flags viraram a config oficial recomendada em `QUALITY.md`
+  (com ressalva Xe2: re-rodar golden em outra arch). Nenhum source/commit de merge tocado no perf-pass.
+- **PPL turbo-quality-gate AINDA PENDENTE:** o perf-pass mede tok/s, NÃO qualidade de tipo turbo.
+  Qwen3-4B serve p/ velocidade mas NÃO p/ PPL turbo. Falta o modelo puro-atenção validado + `wikitext-2-raw`
+  local p/ rodar `scripts/turbo-quality-gate.sh` (turbo3 PPL < 1.05x q8_0; ratio velocidade > 0.95 @4K).
 
 ## Sync upstream 2026-07 — resumo do estado
 
