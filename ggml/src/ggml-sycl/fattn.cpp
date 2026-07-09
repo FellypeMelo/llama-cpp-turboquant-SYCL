@@ -152,6 +152,17 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
+    // TURBO BEGIN - asymmetric f16-K + turbo-V: the recommended prod default is q8_0-K, but f16-K
+    // is the maximum-precision asymmetric mode ("V is free, K is everything"). The graph leaves Q
+    // un-rotated when K is f16 (forward Q-WHT gates on K->type in llama-graph.cpp) and still applies
+    // the inverse-WHT on the turbo-V output (gates on V->type), so f16-K + turbo-V is valid. Same
+    // D in {64,128} cap as the other turbo-V rows; K=f16 has no full-D-Q register pressure. Only
+    // (f16, turbo3) is extern-declared (fattn-vec-instance-f16-tq3.cpp); (f16, turbo2)/(f16, turbo4)
+    // are implicitly instantiated here (turbo2/turbo4 are absent from the type_V extern grid).
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_F16, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_F16, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_F16, GGML_TYPE_TURBO4_0)
+    // TURBO END
     // K=turbo / V=q8_0 mixed-KV: arises from layer-adaptive Boundary-V mode 7 (TURBO_LAYER_ADAPTIVE=7)
     // or an explicit "-ctk turboN -ctv q8_0". K stays turbo so Q is still WHT-rotated; V=q8_0 is
     // unrotated and the graph skips the inverse-WHT on those layers (gated on V->type turbo). turbo3/
