@@ -157,11 +157,18 @@ de instancia `template-instances/fattn-vec-instance-f16-tq3.cpp` p/ o unico comb
   gateia em `v->type` turbo (`llama-graph.cpp`), entao K=f16 deixa Q NAO-rotada enquanto V=turbo ainda
   aplica a inverse-WHT na saida. Nenhuma edicao de grafo necessaria.
 - `GGML_SYCL_FA_ALL_QUANTS` continua **OFF** (ADR-0004). As rows novas NAO exigem religa-lo: so
-  precisam do 1 instance file curado; nao houve LNK2019 (build linka exit 0, DLL relinkada 60.3 MB).
+  precisam do 1 instance file curado; nao houve LNK2019 (build linka exit 0). DLL relinkada:
+  build-sync (JIT) 60.3 MB; build-perf (AOT bmg-g21) 262.5 MB — ambas linkam limpo.
 
-### Evidencia (Arc B580, build-sync)
+### Evidencia (Arc B580, build-sync JIT)
 - Golden `test-sycl-turbo`: 34 PASSED / 0 FAIL. Assimetricas `{q8_0,f16} x {turbo2,turbo3,turbo4}`
   golden decode + DECODE/GQA/padding-mask com cosine 1.000000 (f16 rel-MSE 0.0, q8_0 rel-MSE ~8e-4).
   RED capturado antes do fix: `fattn.cpp:166 Not match KV type: K=f16 V=turbo3`.
 - e2e `test-e2e-turbo-kv.sh`: as 6 assimetricas geram texto COERENTE (keyword on-topic, sem repeticao
   5-gram, sem abort/NaN, sem corrupcao '?').
+
+### Evidencia (Arc B580, build-perf AOT — verify gentil 2026-07-09, ninja -j4 + Idle)
+- Reconfirma sob AOT (bmg-g21): Golden 34/34 (12 asym cosine 1.000000, f16 decode rel-MSE ~2-3e-5,
+  q8_0 ~5e-4; sem regressao nos 21 simetricos). e2e ctest 1/1, 9/9 configs coerentes (Qwen3-4B Q4_K_M).
+- Revisao adversarial read-only (4 lentes): CONFIRMED_GREEN, zero refutacao / zero issue critico.
+- PENDENTE: PPL rescue Qwen2.5-7B Q4_K_M (precisao absoluta long-context) — modelo ausente no disco.
