@@ -1,7 +1,7 @@
 # UPSTREAM SYNC — 2026-07
 
 > Mapa de zonas quentes + playbook determinístico de re-integração turbo.
-> Companheiro dos ADR em `docs/DECISIONS.md`. Ler ambos antes de retomar o sync.
+> Companheiro dos ADR em `docs/pt-BR/decisions.md`. Ler ambos antes de retomar o sync.
 
 ## Referências
 
@@ -152,7 +152,7 @@ Os 31 conflitos foram resolvidos re-integrando a lógica turbo sobre a estrutura
 (NÃO theirs/ours cego). ADR-0003 = Opção A aplicada (Q2_0=42, turbo 43–47, COUNT=48).
 
 ### Build SYCL — VERDE
-- Toolchain: oneAPI 2026.0 (icx/icpx), Ninja, Win10 SDK 10.0.26100. Recipe correto em `QUALITY.md`.
+- Toolchain: oneAPI 2026.0 (icx/icpx), Ninja, Win10 SDK 10.0.26100. Recipe correto em `docs/pt-BR/testing.md`.
 - `cmake --build build-sync --target test-sycl-turbo llama-cli` → **exit 0**, `ggml-sycl.dll` (59 MB),
   `test-sycl-turbo.exe`, `llama-cli.exe` linkados. 0 erros.
 - **3 quebras silenciosas de auto-merge que só o build pegou (corrigidas):**

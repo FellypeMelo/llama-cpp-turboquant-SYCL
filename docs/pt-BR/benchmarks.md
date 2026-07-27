@@ -1,6 +1,6 @@
 # BENCHMARKS — TurboQuant SYCL fork
 
-_Números medidos. Nada estimado. Ler junto com `QUALITY.md` (receita de build+gate) e `STATE.md`._
+_Números medidos. Nada estimado. Ler junto com `docs/pt-BR/testing.md` (receita de build+gate) e `STATE.md`._
 
 ## Perf-pass 2026-07-09 — Intel Arc B580 (Xe2 / BMG)
 
