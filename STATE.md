@@ -1,22 +1,22 @@
 # STATE — TurboQuant SYCL fork
 
-_Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md`, `docs/UPSTREAM_SYNC.md`, `docs/DECISIONS.md`._
+_Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md`, `docs/pt-BR/upstream-sync.md`, `docs/pt-BR/decisions.md`._
 
 ## Onde estamos
 
 - **Branch canônico:** `feature/turboquant-kv-cache` @ `5874b9fe1` — intacto, NÃO tocado neste sync.
 - **Sync CONCLUÍDO (SYCL):** `sync/upstream-2026-07` — `git merge upstream/master` (`fb30ba9a6`) feito,
   os **31 conflitos resolvidos** re-integrando turbo, **build SYCL verde** e **golden gate `test-sycl-turbo`
-  verde (exit 0)** na Arc B580. Detalhes/evidência em `docs/UPSTREAM_SYNC.md` ("Resultado da execução")
-  e `QUALITY.md`. ADR-0003 = Opção A (enum turbo 43–47); ADR-0004 = `GGML_SYCL_FA_ALL_QUANTS` OFF.
+  verde (exit 0)** na Arc B580. Detalhes/evidência em `docs/pt-BR/upstream-sync.md` ("Resultado da execução")
+  e `docs/pt-BR/testing.md`. ADR-0003 = Opção A (enum turbo 43–47); ADR-0004 = `GGML_SYCL_FA_ALL_QUANTS` OFF.
   **Merge commitado apenas com build+gate verdes; NÃO pushado.**
   Pendências honestas (não bloqueiam SYCL): PPL/bench gate (falta modelo puro-atenção + wikitext local);
   CUDA/Metal/Vulkan resolvidos mas não compilados (build SYCL-only); Vulkan turbo3 FA scalar/coopmat1
   não-funcional pós-merge (CM2 preservado) — best-effort não-Arc.
-- **Perf-pass CONCLUÍDO (2026-07-09, Arc B580):** build-perf com F16+AOT+DNN (ver `QUALITY.md`).
+- **Perf-pass CONCLUÍDO (2026-07-09, Arc B580):** build-perf com F16+AOT+DNN (ver `docs/pt-BR/testing.md`).
   Golden `test-sycl-turbo` VERDE (22/22, cosine ~1.0) — flags de perf NÃO corrompem o turbo no Xe2.
   Bench (Qwen3-4B Q4_K_M): **prefill +102.8% (2.03x)**, decode -3.3% (ruído). Saída coerente. Números
-  medidos em `docs/BENCHMARKS.md`. As flags viraram a config oficial recomendada em `QUALITY.md`
+  medidos em `docs/pt-BR/benchmarks.md`. As flags viraram a config oficial recomendada em `docs/pt-BR/testing.md`
   (com ressalva Xe2: re-rodar golden em outra arch). Nenhum source/commit de merge tocado no perf-pass.
 - **PPL turbo-quality-gate AINDA PENDENTE:** o perf-pass mede tok/s, NÃO qualidade de tipo turbo.
   Qwen3-4B serve p/ velocidade mas NÃO p/ PPL turbo. Falta o modelo puro-atenção validado + `wikitext-2-raw`
@@ -24,7 +24,7 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 - **Turbo KV e2e COERÊNCIA — FEITO (2026-07-09, Arc B580):** prova de geração real ponta-a-ponta com turbo
   KV ligado (não parity de kernel). Novo gate `tests/test-e2e-turbo-kv.sh` (ctest `test-e2e-turbo-kv`,
   labels `e2e;gpu;turbo`, SKIP 77 sem modelo) — **VERDE** via ctest na B580 (~15 s). Matriz completa medida
-  (f16→turbo2) em `docs/BENCHMARKS.md`. **Veredito: turbo KV gera COERENTE** nas simétricas SYCL-safe
+  (f16→turbo2) em `docs/pt-BR/benchmarks.md`. **Veredito: turbo KV gera COERENTE** nas simétricas SYCL-safe
   (`turbo3/turbo3` 5.12×, `turbo4/turbo4` 3.76×, `turbo2/turbo2` auto-mode-8 5.65×; decode ~74 t/s ≈ f16).
   **Config ÓTIMA (máx. compressão coerente): `-ctk turbo2 -ctv turbo2`** (5.65× menos VRAM-KV); default
   robusto `turbo3/turbo3`. Achados honestos: turbo2 uniforme (`TURBO_LAYER_ADAPTIVE=0`) DEGRADA (repetição);
@@ -45,7 +45,7 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 
 | Métrica | Valor |
 |---|---|
-| Arquivos em conflito | 31 (bounded, caracterizados em `UPSTREAM_SYNC.md`) |
+| Arquivos em conflito | 31 (bounded, caracterizados em `docs/pt-BR/upstream-sync.md`) |
 | Auto-merges silenciosos de risco | `ggml.c`, `ggml-common.h` (BAIXO), `llama-graph.cpp` (+912, MÉDIO), `dmmv.cpp` (+916, MÉDIO) |
 | Colisão dura | enum `ggml_type` slot 42 (Q2_0 vs turbo) → **decisão do dono pendente** (ADR-0003) |
 | Resolvidos | **31 / 31** (turbo re-integrado sobre estrutura nova upstream) |
@@ -66,8 +66,8 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
 ## Próximos passos (ordem)
 
 1. **Dono decide ADR-0003** (numeração enum slot 42): há GGUF TQ3_1S/TQ4_1S em uso? → Opção A (alinhar upstream, recomendada) ou B (preservar IDs turbo).
-2. Sessão **com oneAPI no PATH**: `git switch sync/upstream-2026-07 && git merge upstream/master`, resolver os 31 pelo playbook de `UPSTREAM_SYNC.md` (ordem P0→P1→P2→P3).
-3. Build SYCL (receita em `UPSTREAM_SYNC.md` / `TURBO_HANDOFF.md`).
+2. Sessão **com oneAPI no PATH**: `git switch sync/upstream-2026-07 && git merge upstream/master`, resolver os 31 pelo playbook de `docs/pt-BR/upstream-sync.md` (ordem P0→P1→P2→P3).
+3. Build SYCL (receita em `docs/pt-BR/upstream-sync.md` / `TURBO_HANDOFF.md`).
 4. Gate: `test-sycl-turbo` verde + `turbo-quality-gate.sh` dentro de 5% + `tqp-sycl.yml` verde. Sem regressão bench > 5%.
 5. Só então commitar o merge. **Não push** sem aprovação do dono.
 

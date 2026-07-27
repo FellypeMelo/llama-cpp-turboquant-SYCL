@@ -1,14 +1,53 @@
+[English](README.md) | [Português (Brasil)](README.pt-BR.md)
+
 # TurboQuant+ on SYCL — rotated low-bit KV cache for Intel GPUs
 
 [![TurboQuant+ SYCL CI/CD](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/actions/workflows/tqp-sycl.yml/badge.svg)](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/actions/workflows/tqp-sycl.yml)
 [![Release](https://img.shields.io/github/v/release/FellypeMelo/llama-cpp-turboquant-SYCL?include_prereleases&label=release)](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-> A `llama.cpp` fork that implements **TurboQuant** — 2/3/4-bit *rotated* KV-cache quantization — on the **SYCL backend for Intel GPUs** (Arc / Xe2). Up to **7.5× less KV-cache memory** than fp16, with **prefill at fp16 parity**, validated on an Intel Arc B580.
+> A `llama.cpp` fork that adds **TurboQuant** — 2/3/4-bit *rotated* KV-cache quantization — to the **SYCL backend for Intel GPUs** (Arc / Xe2). Up to **7.5× less KV-cache memory** than fp16, with **prefill at fp16 parity**, measured on an Intel Arc B580.
 
-**Why it matters:** for long-context inference the KV cache is the memory wall. fp16 KV for Qwen3-4B at 64k context is 9.2 GB — it alone nearly fills a 12 GB card. TurboQuant rotates each key/value vector with a Walsh–Hadamard transform (an orthogonal outlier-smoother) *before* quantizing it, so a tiny 2–4-bit codebook reconstructs it near-losslessly.
+This is a personal engineering fork, not a general-purpose product: it targets one backend (SYCL / Intel GPU) and is validated on one hardware/model combination (Arc B580, Qwen3-4B Q4_K_M). Everything below states exactly what was measured, on what, and links to the source doc — see the results table further down for the full picture, including the one known limitation (decode slows at depth, same as every other quantized KV format).
 
-### Headline results — Intel Arc B580, Qwen3-4B Q4_K_M
+## Why it matters
+
+For long-context inference the KV cache — not the model weights — is the memory wall. An fp16 KV cache for Qwen3-4B at 64k context is 9.2 GB, which alone nearly fills a 12 GB card. The common mitigation, `q8_0` KV, only halves it. TurboQuant compresses much harder: it rotates each key/value vector with a Walsh–Hadamard transform (an orthogonal outlier-smoother) *before* quantizing it, so a tiny 2–4-bit codebook reconstructs the vector near-losslessly.
+
+## Architecture
+
+TurboQuant is threaded through the `ggml` compute graph rather than folded inline into the attention kernel: the rotation is its own graph op (`GGML_OP_TURBO_WHT`), K/V are rotated once at cache-write time, and the query is rotated once per step before the attention score.
+
+```mermaid
+flowchart LR
+    subgraph write["cache write — set_rows.cpp (SYCL)"]
+        kv["K / V vector<br/>head_dim = 128"] --> wht1["Walsh-Hadamard rotate<br/>(signs -> butterfly -> signs)"]
+        wht1 --> quant["Lloyd-Max quantize<br/>turbo2 / turbo3 / turbo4"]
+        quant --> cache[("packed KV block<br/>34 / 50 / 68 bytes per 128 values")]
+    end
+
+    q["query vector"] --> whtq["GGML_OP_TURBO_WHT<br/>rotate Q"]
+
+    subgraph decode["decode attention — fattn-vec.hpp (VEC)"]
+        cache --> deq1["dequant inline,<br/>per element, per step"]
+        whtq --> dot1["Q . K, softmax, weighted V"]
+        deq1 --> dot1
+        dot1 --> inv1["inverse WHT<br/>un-rotate output"]
+    end
+
+    subgraph prefill["prefill attention — fattn-tile.hpp (TILE)"]
+        cache --> deq2["dequant to contiguous<br/>f16 scratch buffer"]
+        whtq --> dot2["unmodified upstream<br/>f16 TILE flash-attention"]
+        deq2 --> dot2
+        dot2 --> inv2["inverse WHT<br/>un-rotate output"]
+    end
+```
+
+Decode reuses the existing memory-bound VEC kernel — dequantizing turbo K/V inline is what saves the memory, and is also why decode throughput tracks `q8_0`, not fp16, at depth. Prefill dequantizes turbo K/V to a contiguous f16 buffer and hands it to the unmodified, already-optimized f16 TILE kernel instead of a hand-written low-bit tile loader — that is why prefill lands at fp16 parity instead of the 3–7× slower path a naive turbo-native prefill kernel produced. Full rationale, the six correctness bugs this surfaced, and what was deliberately deferred: [`docs/en/architecture.md`](docs/en/architecture.md) ([pt-BR](docs/pt-BR/architecture.md)).
+
+## Verified results — Intel Arc B580, Qwen3-4B Q4_K_M
+
+All numbers below come from the maintainer's own `llama-bench` / `llama-cli` runs on that specific card and model, logged in [`docs/en/architecture.md`](docs/en/architecture.md) and [`docs/en/benchmarks.md`](docs/en/benchmarks.md); they have not been independently reproduced by a third party.
 
 | Metric | f16 | q8_0 | **turbo3** | **turbo2** |
 |--------|----:|-----:|-----------:|-----------:|
@@ -16,14 +55,15 @@
 | Memory savings vs fp16 | 1× | 1.9× | **5.1×** | **5.6–7.5×** |
 | Prefill pp512 (t/s) | 1267 | 1271 | **1244** | ✓ parity |
 | Prefill pp8192 (t/s) | 580 | — | **577** | ✓ parity |
-| Decode tg128 @ d0 (t/s) | 75.6 | 71.8 | **70.4** | ✓ |
+| Decode tg128 @ depth 0 (t/s) | 75.6 | 71.8 | **70.4** | — |
 
-fp16 @64k nearly OOMs the 12 GB card; turbo runs 64k with 6+ GB free (~256k context reachable). Prefill matches fp16 at every length. See the full picture — including the honest decode-at-depth limitation (inherent to *all* quantized KV, not turbo-specific) — in the deep-dive.
+fp16 @64k nearly OOMs the 12 GB card; turbo runs the same 64k with 6+ GB free (~256k context reachable). Prefill matches fp16 at every length tested — see [Architecture](#architecture) for why.
 
-### 📖 [Read the engineering deep-dive → `docs/TURBOQUANT_SYCL.md`](docs/TURBOQUANT_SYCL.md)
-The rotation math, the two attention paths, the six correctness bugs solved, the full benchmarks, and what was consciously deferred (XMX kernel, native D=64).
+**On the decode row — two runs, not one number:** the session behind this table measured f16 75.6 / q8_0 71.8 / turbo3 70.4 t/s at depth 0. A separate benchmark session, recorded in the deep-dive's own decode-at-depth table (`docs/en/architecture.md`, §6), measured the same metric on the same hardware and model as f16 75.9 / q8_0 72.3 / turbo3 70.8 — a ~0.3–0.5 t/s spread consistent with ordinary run-to-run noise between two separate `llama-bench` invocations, not a change in behavior. Both figures are real measurements; neither is presented here as the single "correct" one. What both runs agree on: turbo decode tracks `q8_0` closely at shallow context and, like `q8_0`, slows down at deep context, because both formats pay a per-element dequant cost inside the decode inner loop that fp16 skips. See §6 of the deep-dive for the full depth table and why this is a property of quantized KV in general, not a TurboQuant-specific regression.
 
-### Quick start
+**A separate build configuration roughly doubles prefill — labeled separately on purpose:** with `GGML_SYCL_F16=ON` plus ahead-of-time device compilation (`GGML_SYCL_DEVICE_ARCH=bmg-g21`), a 2026-07-09 benchmark measured baseline pp512 1246.70 ± 2.87 t/s vs. 2528.80 ± 18.62 t/s with those two flags on (+102.8%), with decode essentially flat (−3.3%, within noise) and the golden correctness test still green. That is a different binary than the one produced by the Quick start below and than the table above (`GGML_SYCL_F16` is off, and there is no AOT compile, in the default build) — see [`docs/en/benchmarks.md`](docs/en/benchmarks.md) and [`docs/en/testing.md`](docs/en/testing.md) for the exact flags and how to build it.
+
+## Quick start
 
 Download a pre-built self-contained package from the [**Releases page**](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/releases) (Windows x64 bundles the oneAPI runtime — no install needed), then:
 
@@ -36,6 +76,53 @@ llama-server -m model.gguf -ngl 99 --flash-attn on \
 On Intel GPUs, set `SYCL_CACHE_PERSISTENT=1` once so the SYCL JIT caches compiled kernels to disk (first launch compiles all kernels).
 
 **Build from source** (Windows, Intel oneAPI): `cmake -B build -G Ninja -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release`.
+
+## Testing & CI
+
+Three gates protect the turbo KV-cache path, in increasing order of scope:
+
+1. **Golden numerical-parity test** — [`tests/test-sycl-turbo.cpp`](tests/test-sycl-turbo.cpp), runs on-device via SYCL. Checks turbo2/turbo3/turbo4 quantize/dequantize, the WHT round-trip, `set_rows`, and flash-attention (including mixed-precision K/V) against an f16 reference by cosine similarity. Documented result on the maintainer's Arc B580: **34/34 PASSED, exit 0**.
+2. **End-to-end coherence gate** — [`tests/test-e2e-turbo-kv.sh`](tests/test-e2e-turbo-kv.sh), wired into CTest as `test-e2e-turbo-kv` (labels `e2e;gpu;turbo`). Drives real `llama-cli` generation with the turbo KV cache enabled and checks the output stays on-topic and non-repetitive across the SYCL-safe symmetric and asymmetric type combinations. It needs a GPU and a local GGUF model, and exits 77 (skip) without either — so it is a no-op on GitHub-hosted CI and only a real gate on the maintainer's self-hosted Arc box.
+3. **PPL / speed quality gate** — [`scripts/turbo-quality-gate.sh`](scripts/turbo-quality-gate.sh) (turbo3 perplexity within 1.05× of the `q8_0` baseline, speed ratio > 0.95 at 4K context). Exists and is wired up, but see [Roadmap](#roadmap): it has not yet been run end-to-end for lack of a locally available pure-attention reference model plus a `wikitext-2-raw` dataset in the sessions documented so far.
+4. **CI/CD** — [`tqp-sycl.yml`](.github/workflows/tqp-sycl.yml) builds Windows and Linux SYCL binaries (including the `test-sycl-turbo` binary) on every push to `feature/turboquant-kv-cache` and on `tqp-sycl-v*` tags, publishing a GitHub Release with a self-contained Windows package on the latter. [`tqp-release.yml`](.github/workflows/tqp-release.yml) is a second, narrower packaging workflow gated on `tqp-v*` tags. **Neither hosted runner has an Intel GPU**: CI proves the build compiles and links (including gate 1's test binary), it does not execute gates 1–3 — those are run manually against real hardware.
+
+Full build flags and the exact gate commands: [`docs/en/testing.md`](docs/en/testing.md).
+
+## Project layout
+
+This is a fork: of roughly 3,100 tracked files, the large majority (`src/`, `ggml/`, `tools/`, `examples/`, the model conversion scripts, most of `docs/`) is unmodified upstream `llama.cpp`. The fork's actual surface area is small:
+
+| Path | What's there |
+|---|---|
+| `ggml/src/ggml-sycl/turbo-quants.hpp`, `turbo-wht.cpp` | Turbo block formats, codebooks, the WHT rotation |
+| `ggml/src/ggml-sycl/set_rows.cpp` | Cache-write kernel (rotate + quantize) |
+| `ggml/src/ggml-sycl/fattn-vec.hpp`, `fattn-tile.hpp`, `fattn.cpp` | Decode (VEC) and prefill (TILE) attention dispatch |
+| `ggml/src/ggml-metal/turbo-matrices.h` | Experimental Metal port of turbo2 (not part of the SYCL gates above) |
+| `src/llama-kv-cache.cpp`, `src/llama-context.cpp` | Per-layer adaptive K/V type selection, asymmetric K/V hooks |
+| `tests/test-sycl-turbo.cpp`, `tests/test-e2e-turbo-kv.sh` | The two turbo-specific test gates (see Testing & CI) |
+| `.github/workflows/tqp-sycl.yml`, `tqp-release.yml` | Fork-specific CI/CD |
+| [`docs/en/`](docs/en/) / [`docs/pt-BR/`](docs/pt-BR/) | Fork-owned documentation, bilingual: architecture deep-dive, ADR log, benchmarks, upstream-merge runbook, testing recipe, roadmap. See [`docs/README.md`](docs/README.md) for the index. |
+
+Everything else follows the standard `llama.cpp` layout described in the unmodified README section below.
+
+## Roadmap
+
+Deliberately deferred or still open, per the engineering notes in [`docs/en/architecture.md`](docs/en/architecture.md) and the full [`docs/en/roadmap.md`](docs/en/roadmap.md):
+
+- **PPL / speed quality gate** (`scripts/turbo-quality-gate.sh`) — wired up but not yet run end-to-end; needs a pure-attention reference model plus a local `wikitext-2-raw` dataset. The golden cosine-similarity gate (Testing & CI, item 1) passes, but that proves numerical parity, not a measured perplexity delta.
+- **XMX (`joint_matrix`) prefill kernel** — a proof-of-concept confirmed Intel's matrix engine works for this on the B580 (one fp16→f32 DPAS tile, error 1e-10), but it is parked: prefill is already at fp16 parity via the dequant-to-f16 path, so the projected additional gain (~1.6% at pp512) does not currently justify the added kernel complexity.
+- **Native head_dim=64 support and turbo K-shift** — scoped but not implemented. Context-shift on a turbo-quantized cache currently disables gracefully (`get_can_shift()` returns `false`) rather than crashing or being supported.
+- **CUDA / Metal / Vulkan turbo support** — present in the codebase from earlier phases of this fork's history (see `ggml/src/ggml-metal/turbo-matrices.h` and the CUDA/Vulkan dispatch paths), but SYCL on Intel Arc is the only backend covered by the gates in Testing & CI; the other backends are best-effort and not currently re-validated on every sync.
+
+Full roadmap, including gate-closure follow-ups and known backend regressions not summarized above: [`docs/en/roadmap.md`](docs/en/roadmap.md) ([pt-BR](docs/pt-BR/roadmap.md)).
+
+## License
+
+MIT, inherited unchanged from upstream `llama.cpp` — see [`LICENSE`](LICENSE). The TurboQuant-specific additions in this fork are contributed under the same terms; there is no separate license file or license terms for the fork's own code.
+
+## Author
+
+Fellype Samuel ([@FellypeMelo](https://github.com/FellypeMelo)) maintains this fork as a personal engineering project on top of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Issues and pull requests about the turbo-specific code are welcome on this repository; issues about `llama.cpp` itself belong upstream.
 
 ---
 
