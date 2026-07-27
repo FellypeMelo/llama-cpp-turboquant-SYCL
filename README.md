@@ -6,9 +6,21 @@
 [![Release](https://img.shields.io/github/v/release/FellypeMelo/llama-cpp-turboquant-SYCL?include_prereleases&label=release)](https://github.com/FellypeMelo/llama-cpp-turboquant-SYCL/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-> A `llama.cpp` fork that adds **TurboQuant** — 2/3/4-bit *rotated* KV-cache quantization — to the **SYCL backend for Intel GPUs** (Arc / Xe2). Up to **7.5× less KV-cache memory** than fp16, with **prefill at fp16 parity**, measured on an Intel Arc B580.
+> Brings **TurboQuant** — 2/3/4-bit *rotated* KV-cache quantization — to the **SYCL backend for Intel GPUs** (Arc / Xe2). Up to **7.5× less KV-cache memory** than fp16, with **prefill at fp16 parity**, measured on an Intel Arc B580.
 
-This is a personal engineering fork, not a general-purpose product: it targets one backend (SYCL / Intel GPU) and is validated on one hardware/model combination (Arc B580, Qwen3-4B Q4_K_M). Everything below states exactly what was measured, on what, and links to the source doc — see the results table further down for the full picture, including the one known limitation (decode slows at depth, same as every other quantized KV format).
+## Credit and scope
+
+**TurboQuant is not this fork's invention.** The scheme — Walsh–Hadamard rotation followed by Lloyd–Max codebook quantization of the KV cache — and its original Metal and CUDA implementations were created by [**TheTom**](https://github.com/TheTom) and [**Gabe Ortiz**](https://github.com/signalnine), with further contributions from Sean, Tuklus-Labs, Simon Gardling and Nathan Maine, in [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant). This repository is a fork of that project, which is itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+**What this fork contributes** is the Intel side of it, across 16 commits to `ggml/src/ggml-sycl/`:
+
+- the SYCL port of the turbo block formats, codebooks and WHT rotation kernels;
+- a correctness fix to the WHT rotation that made flash-attention usable with a turbo KV cache at all;
+- a prefill path that dequantizes to an f16 scratch buffer so the unmodified upstream f16 TILE kernel can run it, recovering roughly 3–7× over the naive path;
+- asymmetric-precision dispatch, so K can stay at `q8_0`/`f16` while V goes low-bit;
+- the golden numerical-parity test and the end-to-end coherence gate that keep the above honest on real hardware.
+
+This is a personal engineering fork, not a general-purpose product, and it has not been merged upstream: it targets one backend (SYCL / Intel GPU) and is validated on one hardware/model combination (Arc B580, Qwen3-4B Q4_K_M). Everything below states exactly what was measured, on what, and links to the source doc — see the results table further down for the full picture, including the one known limitation (decode slows at depth, same as every other quantized KV format).
 
 ## Why it matters
 
@@ -90,7 +102,7 @@ Full build flags and the exact gate commands: [`docs/en/testing.md`](docs/en/tes
 
 ## Project layout
 
-This is a fork: of roughly 3,100 tracked files, the large majority (`src/`, `ggml/`, `tools/`, `examples/`, the model conversion scripts, most of `docs/`) is unmodified upstream `llama.cpp`. The fork's actual surface area is small:
+Of roughly 3,100 tracked files, the large majority (`src/`, `ggml/`, `tools/`, `examples/`, the model conversion scripts, most of `docs/`) is unmodified upstream `llama.cpp`, and the Metal/CUDA turbo implementations come from the parent fork. This fork's own surface area is small and lives almost entirely under `ggml-sycl/`:
 
 | Path | What's there |
 |---|---|
@@ -122,7 +134,9 @@ MIT, inherited unchanged from upstream `llama.cpp` — see [`LICENSE`](LICENSE).
 
 ## Author
 
-Fellype Samuel ([@FellypeMelo](https://github.com/FellypeMelo)) maintains this fork as a personal engineering project on top of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Issues and pull requests about the turbo-specific code are welcome on this repository; issues about `llama.cpp` itself belong upstream.
+Fellype Samuel ([@FellypeMelo](https://github.com/FellypeMelo)) maintains this fork as a personal engineering project, and authored the SYCL/Intel-Arc work described under [Credit and scope](#credit-and-scope). TurboQuant itself belongs to the authors of [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant); `llama.cpp` belongs to [ggml-org](https://github.com/ggml-org/llama.cpp).
+
+Issues and pull requests about the SYCL turbo path are welcome on this repository. Issues about the turbo scheme itself belong to the parent fork, and issues about `llama.cpp` belong upstream.
 
 ---
 
