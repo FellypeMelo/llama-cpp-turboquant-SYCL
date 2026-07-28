@@ -353,7 +353,42 @@ static void turbo_dequant_to_f16_sycl(const char * src, sycl::half * dst,
     });
 }
 
-static void turbo_dequant_tensor_to_f16(const ggml_tensor * t, sycl::half * dst, queue_ptr stream) {
+// q8_0 shares the same blocked/strided layout but keeps its scale in `d` and stores plain int8
+// quants, so it cannot be expressed as a dequant_fn(block, j, norm) instance.
+static void k_q8_0_dequant_to_f16(const char * __restrict__ src, sycl::half * __restrict__ dst,
+                                  const int64_t ne0, const int64_t ne1, const int64_t ne2,
+                                  const int64_t nb1, const int64_t nb2,
+                                  const sycl::nd_item<3> & it) {
+    const int64_t i0 = (int64_t) it.get_global_id(2); // head-dim element
+    const int64_t i1 = (int64_t) it.get_global_id(1); // KV position
+    const int64_t i2 = (int64_t) it.get_global_id(0); // KV head
+    if (i0 >= ne0 || i1 >= ne1 || i2 >= ne2) {
+        return;
+    }
+    const block_q8_0 * blk = (const block_q8_0 *) (src + i1*nb1 + i2*nb2) + (i0 / QK8_0);
+    const float v = (float) blk->d * (float) blk->qs[i0 % QK8_0];
+    dst[(i2*ne1 + i1)*ne0 + i0] = (sycl::half) v; // contiguous [ne0, ne1, ne2]
+}
+
+static void q8_0_dequant_to_f16_sycl(const char * src, sycl::half * dst,
+                                     int64_t ne0, int64_t ne1, int64_t ne2,
+                                     int64_t nb1, int64_t nb2, queue_ptr stream) {
+    constexpr int WG = 64;
+    const sycl::range<3> lws(1, 1, WG);
+    const sycl::range<3> gws(ne2, ne1, ((ne0 + WG - 1) / WG) * WG);
+    stream->parallel_for(sycl::nd_range<3>(gws, lws), [=](sycl::nd_item<3> it) {
+        k_q8_0_dequant_to_f16(src, dst, ne0, ne1, ne2, nb1, nb2, it);
+    });
+}
+
+// Quantized KV types the prefill shim can materialize as contiguous f16 for the f16 TILE.
+// F16 is handled by passing the tensor through untouched, so it is not listed here.
+static bool kv_dequantizable_to_f16(ggml_type t) {
+    return t == GGML_TYPE_Q8_0 ||
+           t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+}
+
+static void kv_dequant_tensor_to_f16(const ggml_tensor * t, sycl::half * dst, queue_ptr stream) {
     const char *  src = (const char *) t->data;
     const int64_t ne0 = t->ne[0], ne1 = t->ne[1], ne2 = t->ne[2];
     const int64_t nb1 = t->nb[1], nb2 = t->nb[2];
@@ -364,12 +399,19 @@ static void turbo_dequant_tensor_to_f16(const ggml_tensor * t, sycl::half * dst,
             turbo_dequant_to_f16_sycl<block_turbo3_0, QK_TURBO3, dequantize_turbo3_0>(src, dst, ne0, ne1, ne2, nb1, nb2, stream); break;
         case GGML_TYPE_TURBO4_0:
             turbo_dequant_to_f16_sycl<block_turbo4_0, QK_TURBO4, dequantize_turbo4_0>(src, dst, ne0, ne1, ne2, nb1, nb2, stream); break;
+        case GGML_TYPE_Q8_0:
+            q8_0_dequant_to_f16_sycl(src, dst, ne0, ne1, ne2, nb1, nb2, stream); break;
         default:
-            GGML_ABORT("turbo_dequant_tensor_to_f16: not a turbo type");
+            GGML_ABORT("kv_dequant_tensor_to_f16: unsupported KV type");
     }
 }
 
-// Dequantize symmetric turbo K/V to transient f16 and run the f16 TILE for prefill.
+// Dequantize a turbo-bearing K/V pair to transient f16 and run the f16 TILE for prefill.
+// Handles symmetric turbo as well as the asymmetric pairs ({f16,q8_0} x turbo and the reverse):
+// each non-f16 side gets a contiguous f16 shadow, an f16 side is passed through untouched.
+// Rotation stays consistent because the graph gates the forward Q-WHT on the *original* K type
+// and the output inverse-WHT on the *original* V type; both were fixed at graph-build time and
+// the turbo dequant reproduces the rotated domain the rotated Q expects.
 // Returns true if it handled dst; false to fall through to the normal kernel selection.
 static bool ggml_sycl_flash_attn_ext_turbo_prefill(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -379,37 +421,65 @@ static bool ggml_sycl_flash_attn_ext_turbo_prefill(ggml_backend_sycl_context & c
     auto is_turbo = [](ggml_type t) {
         return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
     };
-    // Symmetric turbo only; mixed (q8_0/turbo) and decode keep their existing paths.
-    if (!(is_turbo(K->type) && is_turbo(V->type) && K->type == V->type)) return false;
-    if (Q->ne[1] <= 2) return false;                          // decode -> keep turbo VEC
+    auto f16able = [](ggml_type t) { return t == GGML_TYPE_F16 || kv_dequantizable_to_f16(t); };
+
+    // Require a turbo V and never mix turbo widths. That leaves exactly two shapes: symmetric turbo,
+    // and the production-relevant asymmetry (precise K + compressed V, "V is free, K is everything").
+    // The rest are refused on purpose, each for its own reason:
+    //   - (turbo K, f16 V) has no curated FATTN_VEC_CASES_TURBO_D row, so decode aborts anyway;
+    //   - (turbo K, q8_0 V) keeps its existing VEC prefill because routing it through the f16 TILE
+    //     drifts past the golden rel-MSE bound for the coarsest K (turbo2 x q8_0 measured 8.3e-3
+    //     against a 6e-3 tolerance on B580, while turbo3/turbo4 land at 1.9e-3/1.2e-3);
+    //   - mixed-width turbo (turbo2 K with turbo3 V, say) has no vec instance either, and is
+    //     reachable both directly and through TURBO_LAYER_ADAPTIVE modes 5/6. Letting it in here
+    //     would make prefill succeed and push the abort to the first decode token, i.e. after the
+    //     whole prompt had already been processed.
+    if (!is_turbo(V->type)) return false;
+    if (!f16able(K->type)) return false;
+    if (is_turbo(K->type) && K->type != V->type) return false;
+    // Column threshold. This shim dequantizes the ENTIRE K/V cache into f16 scratch, so it only
+    // pays for itself once there are enough Q columns to amortise that full-cache pass; break-even
+    // is around 12-16 columns. Batched decode under a unified KV cache produces a small
+    // Q->ne[1] > 2 with K->ne[3] == 1 (llama-server defaults to n_parallel 4 + kv_unified, and
+    // speculative decoding contributes draft+1 columns), which must stay on VEC. Real prefill
+    // chunks are n_batch-sized and clear 16 by a wide margin. The bound is a property of this shim,
+    // not of the K type, so symmetric turbo gets it too.
+    if (Q->ne[1] < 16) return false;                          // decode -> keep turbo VEC
     const int64_t D = K->ne[0];
     if (!(D == 64 || D == 128 || D == 256 || D == 512)) return false; // f16 TILE head sizes
     if (V->ne[0] != D) return false;                          // e.g. transposed V -> bail to VEC
+    // The dequant kernels index [ne0,ne1,ne2] only; a batched cache would be silently truncated.
+    if (K->ne[3] != 1 || V->ne[3] != 1) return false;
 
     queue_ptr stream = ctx.stream();
     ggml_sycl_pool_alloc<sycl::half> k_f16(ctx.pool());
     ggml_sycl_pool_alloc<sycl::half> v_f16(ctx.pool());
-    k_f16.alloc(ggml_nelements(K));
-    v_f16.alloc(ggml_nelements(V));
-    turbo_dequant_tensor_to_f16(K, k_f16.get(), stream);
-    turbo_dequant_tensor_to_f16(V, v_f16.get(), stream);
 
-    // Contiguous f16 shadows of K/V; the f16 TILE reads them via their strides.
+    // Contiguous f16 shadows; the f16 TILE reads K and V through independent strides
+    // (stride_K2 = nb11/2, stride_V2 = nb21/2), so a shadow may be mixed with a real f16 view.
     ggml_tensor Kf = *K;
-    Kf.type = GGML_TYPE_F16;
-    Kf.data = k_f16.get();
-    Kf.nb[0] = sizeof(sycl::half);
-    Kf.nb[1] = Kf.nb[0] * Kf.ne[0];
-    Kf.nb[2] = Kf.nb[1] * Kf.ne[1];
-    Kf.nb[3] = Kf.nb[2] * Kf.ne[2];
+    if (K->type != GGML_TYPE_F16) {
+        k_f16.alloc(ggml_nelements(K));
+        kv_dequant_tensor_to_f16(K, k_f16.get(), stream);
+        Kf.type = GGML_TYPE_F16;
+        Kf.data = k_f16.get();
+        Kf.nb[0] = sizeof(sycl::half);
+        Kf.nb[1] = Kf.nb[0] * Kf.ne[0];
+        Kf.nb[2] = Kf.nb[1] * Kf.ne[1];
+        Kf.nb[3] = Kf.nb[2] * Kf.ne[2];
+    }
 
     ggml_tensor Vf = *V;
-    Vf.type = GGML_TYPE_F16;
-    Vf.data = v_f16.get();
-    Vf.nb[0] = sizeof(sycl::half);
-    Vf.nb[1] = Vf.nb[0] * Vf.ne[0];
-    Vf.nb[2] = Vf.nb[1] * Vf.ne[1];
-    Vf.nb[3] = Vf.nb[2] * Vf.ne[2];
+    if (V->type != GGML_TYPE_F16) {
+        v_f16.alloc(ggml_nelements(V));
+        kv_dequant_tensor_to_f16(V, v_f16.get(), stream);
+        Vf.type = GGML_TYPE_F16;
+        Vf.data = v_f16.get();
+        Vf.nb[0] = sizeof(sycl::half);
+        Vf.nb[1] = Vf.nb[0] * Vf.ne[0];
+        Vf.nb[2] = Vf.nb[1] * Vf.ne[1];
+        Vf.nb[3] = Vf.nb[2] * Vf.ne[2];
+    }
 
     ggml_tensor dstc = *dst;
     dstc.src[1] = &Kf;

@@ -172,3 +172,150 @@ de instancia `template-instances/fattn-vec-instance-f16-tq3.cpp` p/ o unico comb
   q8_0 ~5e-4; sem regressao nos 21 simetricos). e2e ctest 1/1, 9/9 configs coerentes (Qwen3-4B Q4_K_M).
 - Revisao adversarial read-only (4 lentes): CONFIRMED_GREEN, zero refutacao / zero issue critico.
 - PENDENTE: PPL rescue Qwen2.5-7B Q4_K_M (precisao absoluta long-context) — modelo ausente no disco.
+
+---
+
+## ADR-0006 — Prefill assimetrico entra no Option A, atras de um limiar de colunas
+
+**Data:** 2026-07-28
+**Status:** Aceito (validado na Arc B580, build-perf AOT bmg-g21)
+
+### Contexto
+O Option A (ver TURBOQUANT_SYCL.md secao 4) resolveu o prefill turbo dequantizando K/V para f16
+transitorio e reusando o TILE f16 provado. Mas o portao era **simetrico**:
+
+```cpp
+if (!(is_turbo(K->type) && is_turbo(V->type) && K->type == V->type)) return false;
+```
+
+O default de producao recomendado pelo proprio fork e `-ctk q8_0 -ctv turbo3`, que e assimetrico e
+portanto **nunca** entrava nesse atalho. O router forca VEC para qualquer lado turbo
+(`fattn.cpp:297-299`) e o VEC e orientado a decode, entao o prefill assimetrico rodava no kernel
+errado. Medido antes da mudanca (B580, AOT, Qwen3-4B Q4_K_M): **pp8192 = 95,7 t/s contra 798,5 do
+f16**, ou seja ~12% da velocidade do f16 — enquanto o simetrico ja estava em paridade.
+
+### Decisao
+Generalizar o shim: exigir **V turbo**, com K em `{f16, q8_0, turbo}`. Cada lado nao-f16 recebe um
+shadow f16 contiguo; um lado que ja e f16 passa direto, porque o TILE le K e V por strides
+independentes (`stride_K2 = nb11/2`, `stride_V2 = nb21/2`, `fattn-tile.hpp:806-807`).
+
+A semantica de rotacao nao precisou de nenhuma edicao de grafo: os portoes da Q-WHT forward
+(`k->type`) e da inverse-WHT de saida (`v->type`) sao decididos na construcao do grafo, antes do op
+de FA, entao trocar `src[1]`/`src[2]` por shadows f16 dentro do shim nao pode dessincronizar nada.
+
+Tres formas ficam **de fora**, cada uma por um motivo:
+- `(turbo K, f16 V)` nao tem row curada em `FATTN_VEC_CASES_TURBO_D`, entao o decode aborta de
+  qualquer jeito. Deixar o prefill passar so adiaria o abort.
+- `(turbo K, q8_0 V)` roteado pelo TILE mede rel-MSE **8,3e-3** com turbo2-K contra o limite de
+  6e-3 (turbo3 1,9e-3, turbo4 1,2e-3). No VEC, o mesmo par mede **0,0**. Fica no VEC.
+- **turbo de larguras diferentes** (turbo2 K com turbo3 V, por exemplo) tambem nao tem instancia vec.
+  A primeira versao deste patch aceitava esses pares por acidente: `f16able` inclui os tipos turbo e
+  `symmetric_turbo` dava false, entao o prefill rodava no TILE e o abort so aparecia no primeiro
+  token de decode — depois do prompt inteiro processado. Antes do patch o portao exigia
+  `K->type == V->type` e o abort era imediato. Pego por revisao adversarial de pre-merge, nao por
+  teste; corrigido com `if (is_turbo(K->type) && K->type != V->type) return false;`. Alcancavel
+  direto por `--cache-type-k turbo2 --cache-type-v turbo3` e pelos modos `TURBO_LAYER_ADAPTIVE` 5/6.
+
+### Limiar de colunas: 16, uniforme
+O shim dequantiza o cache K/V **inteiro**. Sob cache unificado o `llama-server` default
+(`n_parallel = 4`, `kv_unified = true`, `tools/server/server.cpp:146-150`) empacota todos os slots
+num unico ubatch, entao 3 ou mais slots decodificando produzem `Q->ne[1] >= 3` com `K->ne[3] == 1`.
+Com o divisor original `Q->ne[1] <= 2`, **cada passo de decode em lote** arrastaria o cache inteiro
+por um dequant para servir 3-4 colunas: ~3x de trafego de memoria, com break-even so por volta de
+12-16 colunas. Chunks reais de prefill sao do tamanho de `n_batch` e passam de 16 com folga.
+
+O limiar vale para o **simetrico tambem**. A primeira versao deixava o simetrico no `>2` original
+por conservadorismo, mas isso e incoerente: o break-even e propriedade do shim (um passe pelo cache
+inteiro amortizado sobre N colunas), nao do tipo de K. Manter 3 no simetrico preservaria
+conscientemente a mesma patologia que o proprio ADR documenta — sob `-np 4` com cache unificado, o
+shadow f16 chega a ordem de 10x o trafego que o VEC leria. Custo da uniformizacao: prompts com menos
+de 16 tokens passam a fazer prefill no VEC, o que e desprezivel em termos absolutos.
+
+Ambos os riscos (o widening no decode em lote e a incoerencia do limiar) foram encontrados por
+revisao adversarial read-only, **nao** por bench — o bench de prefill sozinho so teria mostrado o
+ganho.
+
+### Descoberta colateral: o Q tambem e quantizado quando K e q8_0
+`fattn-vec.hpp:124`:
+
+```cpp
+constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && !K_is_turbo;
+```
+
+Com `K=q8_0` e `V=turbo`, o proprio **Q** vira q8_1 para o produto KQ. K f16 e K turbo escapam
+disso. Medido no golden, mesma entrada, so mudando o numero de colunas (e portanto o kernel):
+
+| n_q | caminho | rel-MSE |
+|----:|---------|--------:|
+| 8   | VEC (Q em q8_1) | 0,0551 |
+| 16  | f16 TILE        | 0,0038 |
+
+O TILE e ~21x mais preciso para esse par. Isso **nao** motivou baixar o limiar, porque o custo de
+trafego em decode em lote continua real — mas registra que, acima de 16 colunas, o assimetrico ganha
+velocidade **e** precisao ao mesmo tempo.
+
+### Evidencia (Arc B580, build-perf AOT bmg-g21, Qwen3-4B Q4_K_M)
+Prefill, `llama-bench -fa 1 -r 2`, mesmo binario AOT antes e depois:
+
+| teste  | antes | depois | ganho | f16 (teto) |
+|--------|------:|-------:|------:|-----------:|
+| pp512  | 630,24 | **2539,98** | 4,0x | 2582,04 |
+| pp2048 | 299,21 | **1766,34** | 5,9x | 1768,90 |
+| pp8192 |  95,69 |  **797,96** | 8,3x |  798,49 |
+
+Paridade com f16 de 98,4% (pp512) a 99,9% (pp2048/pp8192). Supera ate o turbo3 simetrico
+(2487 / 1736 / 791), porque dequantizar K em q8_0 custa menos que em turbo3.
+
+- Golden `test-sycl-turbo` sob AOT: **58 PASSED / 0 FAILED** (inclui os novos casos assimetricos em
+  n_q=8 e n_q=16 e o contexto profundo n_kv=8192).
+- e2e `test-e2e-turbo-kv.sh` sob AOT: **9/9 configs coerentes** — os 3 simetricos mais os 6
+  assimetricos `{q8_0,f16} x {turbo2,turbo3,turbo4}`, todos com keyword on-topic, sem repeticao
+  degenerada, sem abort/NaN.
+
+### Ajustes nos gates
+- A tolerancia do golden passou a depender do **caminho** que a forma toma no device, nao so de
+  `n_q`: TILE f16 ~6e-3; VEC com K quantizado nao-turbo (o caso `Q_q8_1`) precisa de bound largo;
+  V q8_0 precisa de 2e-3 em vez de 1e-3 porque o AOT agenda esse dequant com erro maior que o JIT
+  (mesmos casos: 0,0 sob build-sync, 1,2-1,4e-3 sob build-perf, cosine 0,999995 nos dois).
+- Novo caso de **contexto profundo** `n_kv=8192`. Todo o golden rodava em `n_kv=256`, o que da
+  `ntiles_KQ=2` e praticamente nao aciona split-KV; 8192 da `ntiles_KQ=64` e exercita
+  `flash_attn_combine_results`, que e onde o decode long-context realmente vive.
+- `scripts/turbo-quality-gate.sh` reescrito: media o baseline q8_0 ao vivo em vez do
+  `BASELINE_PPL=6.111` hardcoded (que desacoplava o gate do modelo sob teste), cobre os pares
+  assimetricos, usa `awk` no lugar de `bc` (ausente no Git Bash) e sai 77 (SKIP) com mensagem
+  acionavel quando falta binario, modelo ou dataset.
+
+### Adiado (com plano, sem codigo)
+**GQA sharing no VEC (`ncols2 > 1`).** O decode quantizado perde para f16 em profundidade porque o
+f16 vai para o TILE batched-GQA, que le cada row K/V uma vez para todo o grupo GQA, enquanto todo
+tipo quantizado cai no VEC com `launch_fattn<D, cols_per_block, 1, ...>` (`fattn-vec.hpp:632`) — o
+literal `1` e o `ncols2`. Isso re-dequantiza cada row uma vez **por cabeca** do grupo (~4x no modelo
+de referencia).
+
+Uma passada de design read-only estabeleceu que `launch_fattn` e todo o caminho split-KV /
+`flash_attn_combine_results` **ja sao ncols2-aware**; o trabalho fica confinado ao decode de indice
+de head/sequence do kernel VEC. O bloqueio e **pressao de registrador**: em D=128 com V turbo,
+`nthreads_V = 2` (`fattn-vec.hpp:113-115`) infla o acumulador `VKQ` para ~64 dwords/lane, entao
+`ncols2 = 2` so cabe se `nthreads_V` subir junto, e `ncols2 = 4` nao cabe. Spill de GRF no Intel e o
+modo de falha conhecido. Nao entra sem medicao propria.
+
+**Perplexidade do turbo simetrico.** Ao consertar o quality gate ele rodou pela primeira vez e reprovou
+`turbo3 x turbo3`. Medido (wikitext-2, Qwen3-4B Q4_K_M, `-c 512 --chunks 32`, B580 AOT), PPL vs f16
+9,054: `q8_0 x turbo3` 9,091 (+0,4%), `f16 x turbo3` 9,104 (+0,6%), `turbo4 x turbo4` 9,511 (+5,1%),
+`turbo3 x q8_0` 11,781 (+30,1%), `turbo3 x turbo3` 11,920 (+31,7%), `turbo2 x turbo2` 12,821 (+41,6%).
+
+As linhas `turbo3 x q8_0` e `q8_0 x turbo3` isolam a causa: turbo3 no V custa 0,4%, no K custa 30%
+(~75x). Pre-existente, sem relacao com este ADR. Os exemplos de uso da doc foram corrigidos para
+`-ctk q8_0 -ctv turbo3`. **O golden e estruturalmente cego a isso**: ele compara o device contra um
+golden de CPU construido a partir dos MESMOS dados quantizados, entao o erro de quantizacao cancela dos
+dois lados — ele mede fidelidade de kernel, nao qualidade de quantizacao. Consequencia pratica: o gate
+de perplexidade nao e opcional, e enquanto o simetrico nao for tratado (ou removido da recomendacao) o
+script sai 1 de proposito. Em aberto: o salto turbo4 (+5,1%) -> turbo3 (+31,7%) e abrupto para 1,1 bit,
+e turbo4 usa PolarQuant enquanto turbo2/3 usam codebook de centroides — o codebook de 8 niveis do
+turbo3 pode estar rendendo abaixo do esperado. Nao investigado.
+
+**Divisor de `nsm` no Xe2.** `ggml-sycl.cpp:146` faz `nsm = max_compute_units / 16`. A B580 reporta
+**160** compute units, dando `nsm = 10`, mas o BMG G21 tem 20 Xe-cores (160 vector engines / 8). Se
+o divisor correto for 8, `nsm` esta subestimado em 2x — e ele alimenta `max_blocks_per_sm` e
+`parallel_blocks` em `launch_fattn` (`fattn-common.hpp:1130,1155`) alem de `count-equal.cpp:48-59`.
+Nao mexer sem confirmar a contagem real e sem gatear por arquitetura.
