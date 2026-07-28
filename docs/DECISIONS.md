@@ -371,17 +371,39 @@ Perplexidade (wikitext-2, `-c 512 --chunks 32`, `TURBO_LAYER_ADAPTIVE=0`), e mem
 aritmetica exata de bytes/bloco (conferida contra a tabela da secao 6 do deep-dive em f16, turbo3 e
 turbo4):
 
-| K x V | PPL | vs f16 9,054 | KV @64k | vs f16 |
-|-------|----:|-------------:|--------:|-------:|
-| q8_0 x turbo3   |  9,091 |  +0,4% | 3348 MiB | 2,75x |
-| turbo4 x turbo4 |  9,511 |  +5,1% | 2448 MiB | 3,76x |
-| **turbo4 x turbo3** | **9,564** | **+5,6%** | **2124 MiB** | **4,34x** |
-| **turbo4 x turbo2** | **9,724** | **+7,4%** | **1836 MiB** | **5,02x** |
-| turbo3 x turbo3 | 11,920 | +31,7% | 1800 MiB | 5,12x |
+**Atencao ao modo adaptativo.** `-ctv turbo2` **auto-liga o modo 8** sem env nenhum
+(`llama-kv-cache.cpp`: `type_v == TURBO2_0 && n_layer >= 8`), o que troca 4 camadas de fronteira por
+q8_0/q8_0. Logo `turbo4 x turbo2` tem dois regimes distintos e a tabela precisa separar os dois. Os
+demais pares nao auto-ligam nada.
 
-`turbo4 x turbo3` **domina estritamente** o turbo4 simetrico: 15% menos KV por 0,5 ponto percentual.
-`turbo4 x turbo2` chega a praticamente a economia do turbo3 simetrico (5,02x vs 5,12x) com +7,4% em
-vez de +31,7%.
+| K x V | modo | PPL | vs f16 9,054 | KV @64k | vs f16 |
+|-------|------|----:|-------------:|--------:|-------:|
+| q8_0 x turbo3   | uniforme |  9,091 |  +0,4% | 3348 MiB | 2,75x |
+| turbo4 x turbo4 | uniforme |  9,511 |  +5,1% | 2448 MiB | 3,76x |
+| **turbo4 x turbo2** | **8 (default)** | **9,275** | **+2,4%** | **2176 MiB** | **4,23x** |
+| **turbo4 x turbo3** | **uniforme** | **9,564** | **+5,6%** | **2124 MiB** | **4,34x** |
+| turbo4 x turbo2 | 0 (opt-out) |  9,724 |  +7,4% | 1836 MiB | 5,02x |
+| turbo3 x turbo3 | uniforme | 11,920 | +31,7% | 1800 MiB | 5,12x |
+
+Leituras:
+- `turbo4 x turbo3` **domina estritamente** o turbo4 simetrico: 15% menos KV por 0,5 ponto percentual.
+- **`turbo4 x turbo2` no default e o melhor ponto dos dois**: +2,4% de PPL a 4,23x, ou seja melhor
+  qualidade que `turbo4 x turbo3` com memoria praticamente igual. As 4 camadas q8_0 de fronteira
+  compram mais qualidade do que custam em bytes. Uma versao anterior desta tabela reportou so o
+  regime `TURBO_LAYER_ADAPTIVE=0` e fez esse par parecer pior do que e.
+- Com `TURBO_LAYER_ADAPTIVE=0` o mesmo par vira o ponto de memoria maxima util: 5,02x contra os 5,12x
+  do turbo3 simetrico, com +7,4% em vez de +31,7%.
+
+Memoria calculada por aritmetica de bytes/bloco (por camada por lado @64k, 36 camadas,
+n_embd_k_gqa 1024: f16 128 MiB, q8_0 68, turbo4 34, turbo3 25, turbo2 17), conferida contra a tabela
+da secao 6 do deep-dive onde as duas se sobrepoem.
+
+**Relacao com o gate de qualidade.** Contra o baseline q8_0 (9,091), `turbo4 x turbo3` fica +5,2% e
+`turbo4 x turbo2` em LA=0 fica +7,0% - ou seja, ambos **estourariam o orcamento de 5%** de
+`scripts/turbo-quality-gate.sh`. Por isso nao entraram no `CONFIGS` do gate: sao pontos oferecidos a
+quem esta limitado por memoria, nao configuracoes que o projeto afirma estarem dentro do orcamento.
+O par no default (+2,4% vs f16, +2,0% vs q8_0) passaria, mas depende do modo 8 e por ora fica fora
+tambem, para o gate nao medir uma coisa e o usuario receber outra.
 
 Com o K fixo em turbo4 a degradacao do V e suave (9,511 -> 9,564 -> 9,724 de 4 para 3 para 2 bits),
 o que reconfirma que o V e quase de graca.
