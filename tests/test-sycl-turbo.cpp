@@ -506,8 +506,13 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
                                 type_K == GGML_TYPE_TURBO4_0;
         const bool v_is_turbo = type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0 ||
                                 type_V == GGML_TYPE_TURBO4_0;
-        // Mirrors ggml_sycl_flash_attn_ext_turbo_prefill: turbo V, no mixed turbo widths, 16 columns.
-        const bool uses_tile  = v_is_turbo && !(k_is_turbo && type_K != type_V) && n_q >= 16;
+        // Mirrors ggml_sycl_flash_attn_ext_turbo_prefill: turbo V, 16 columns, and mixed turbo widths
+        // only for the curated turbo4-K pairs. Keep in lockstep with the allowlist in fattn.cpp - a
+        // mismatch here selects the TIGHTER bound, so it surfaces as a failure rather than a false
+        // pass. Do not "fix" such a failure by widening the tolerance.
+        const bool mixed_ok   = type_K == GGML_TYPE_TURBO4_0 &&
+                                (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0);
+        const bool uses_tile  = v_is_turbo && !(k_is_turbo && type_K != type_V && !mixed_ok) && n_q >= 16;
         const bool q_is_q8_1  = !uses_tile && type_K != GGML_TYPE_F16 && !k_is_turbo;
         // A q8_0 V also takes a different dequant path in the vec kernel than a turbo V, and the
         // AOT (bmg-g21) compiler schedules it with slightly wider error than the JIT: the same
@@ -918,6 +923,26 @@ int main() {
         success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1);
         success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 8);
     }
+    // Mixed-width turbo: turbo4 K (the quality knee on K) plus a cheaper turbo V. Both sides are
+    // turbo here, so unlike the precise-K pairs above the graph rotates Q forward AND inverse-rotates
+    // the output. The vec kernel derives nthreads_KQ/vec_dot_KQ from type_K alone and
+    // nthreads_V/V_rows_per_thread/dequantize_V from type_V alone, and turbo2/3/4 all resolve to the
+    // same thread counts - so this is the proven turbo4-K half bolted to the proven turbo3/turbo2-V
+    // half. These cases exist to prove that bolt holds.
+    const asym_cfg mixed_cfgs[] = {
+        { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, "TURBO4_0xTURBO3_0", quantize_row_turbo4_0_ref, quantize_row_turbo3_0_ref },
+        { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, "TURBO4_0xTURBO2_0", quantize_row_turbo4_0_ref, quantize_row_turbo2_0_ref },
+    };
+    printf("\n=== FA turbo golden parity, MIXED-WIDTH turbo4-K x cheaper-turbo-V ===\n");
+    for (const auto & c : mixed_cfgs) {
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1);
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 8);
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 16);
+    }
+    printf("\n=== FA turbo DECODE+GQA+padding-mask, MIXED-WIDTH turbo4-K x cheaper-turbo-V ===\n");
+    for (const auto & c : mixed_cfgs)
+        success &= run_fattn_turbo_decode_mask_gqa(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V);
+
     // Deep context. Every case above runs at n_kv=256, i.e. ntiles_KQ=2, so launch_fattn almost
     // never picks parallel_blocks > 1 and flash_attn_combine_results stays largely unexercised.
     // n_kv=8192 gives ntiles_KQ=64 for the vec kernel (nbatch_fa = D = 128), which is where split-KV
@@ -928,6 +953,7 @@ int main() {
             { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0",     quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref },
             { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
             { GGML_TYPE_F16,      GGML_TYPE_TURBO3_0, "f16xTURBO3_0",  quantize_row_f16_ref_wrap,  quantize_row_turbo3_0_ref },
+            { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, "TURBO4_0xTURBO3_0", quantize_row_turbo4_0_ref, quantize_row_turbo3_0_ref },
         };
         for (const auto & c : deep_cfgs) {
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  8192);

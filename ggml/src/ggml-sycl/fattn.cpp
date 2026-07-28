@@ -171,6 +171,23 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+
+    // TURBO BEGIN - mixed-width turbo KV: turbo4 K plus a cheaper turbo V.
+    // Measured on B580 (wikitext-2, Qwen3-4B Q4_K_M, c=512, 32 chunks, f16 baseline PPL 9.054):
+    // turbo on V costs ~0.4%, turbo on K is what costs, and turbo4 is the quality knee on K
+    // (turbo4 x turbo4 +5.1%, turbo3 x turbo3 +31.7%). So turbo4-K with a cheaper V is a frontier
+    // point symmetric turbo cannot reach: ~4.3-4.5x KV saving instead of 3.76x, at turbo4-K quality.
+    // Neither pair is extern-declared - TURBO4_0 is absent from the type_K axis of
+    // EXTERN_DECL_FATTN_VEC_CASES (fattn-vec.hpp) - so both instantiate implicitly here, exactly
+    // like the (TURBO4_0, TURBO4_0) and (TURBO4_0, Q8_0) rows above. No instance file is needed,
+    // which is where this differs from ADR-0005.
+    // DO NOT add EXTERN_DECL_FATTN_VEC_CASES(D, GGML_TYPE_TURBO4_0): that would suppress the
+    // implicit instantiation for every TURBO4_0-K row and produce LNK2019 (ADR-0004).
+    // The reverse widths (turbo3-K x turbo4-V) cost the same bytes but put the coarse quantizer on
+    // the side that dominates the error, so they are strictly dominated and stay out. See ADR-0007.
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_TURBO_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
+    // TURBO END
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
     GGML_ABORT("Not match KV type in vec: Q->ne[0]=%d K->type=%s V->type=%s",
@@ -430,13 +447,20 @@ static bool ggml_sycl_flash_attn_ext_turbo_prefill(ggml_backend_sycl_context & c
     //   - (turbo K, q8_0 V) keeps its existing VEC prefill because routing it through the f16 TILE
     //     drifts past the golden rel-MSE bound for the coarsest K (turbo2 x q8_0 measured 8.3e-3
     //     against a 6e-3 tolerance on B580, while turbo3/turbo4 land at 1.9e-3/1.2e-3);
-    //   - mixed-width turbo (turbo2 K with turbo3 V, say) has no vec instance either, and is
-    //     reachable both directly and through TURBO_LAYER_ADAPTIVE modes 5/6. Letting it in here
+    //   - mixed-width turbo other than the curated turbo4-K pairs has no vec instance either, and is
+    //     reachable both directly and through TURBO_LAYER_ADAPTIVE modes 5/6. Letting those in here
     //     would make prefill succeed and push the abort to the first decode token, i.e. after the
     //     whole prompt had already been processed.
+    // The allowlist below must stay in lockstep with FATTN_VEC_CASES_TURBO_D above and with
+    // `uses_tile` in tests/test-sycl-turbo.cpp.
+    auto mixed_width_dispatchable = [](ggml_type k, ggml_type v) {
+        return k == GGML_TYPE_TURBO4_0 && (v == GGML_TYPE_TURBO3_0 || v == GGML_TYPE_TURBO2_0);
+    };
     if (!is_turbo(V->type)) return false;
     if (!f16able(K->type)) return false;
-    if (is_turbo(K->type) && K->type != V->type) return false;
+    if (is_turbo(K->type) && K->type != V->type && !mixed_width_dispatchable(K->type, V->type)) {
+        return false;
+    }
     // Column threshold. This shim dequantizes the ENTIRE K/V cache into f16 scratch, so it only
     // pays for itself once there are enough Q columns to amortise that full-cache pass; break-even
     // is around 12-16 columns. Batched decode under a unified KV cache produces a small

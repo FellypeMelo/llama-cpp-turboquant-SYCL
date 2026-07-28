@@ -314,8 +314,93 @@ script sai 1 de proposito. Em aberto: o salto turbo4 (+5,1%) -> turbo3 (+31,7%) 
 e turbo4 usa PolarQuant enquanto turbo2/3 usam codebook de centroides — o codebook de 8 niveis do
 turbo3 pode estar rendendo abaixo do esperado. Nao investigado.
 
-**Divisor de `nsm` no Xe2.** `ggml-sycl.cpp:146` faz `nsm = max_compute_units / 16`. A B580 reporta
+**Divisor de `nsm` no Xe2 (ver tambem ADR-0007).** `ggml-sycl.cpp:146` faz `nsm = max_compute_units / 16`. A B580 reporta
 **160** compute units, dando `nsm = 10`, mas o BMG G21 tem 20 Xe-cores (160 vector engines / 8). Se
 o divisor correto for 8, `nsm` esta subestimado em 2x — e ele alimenta `max_blocks_per_sm` e
 `parallel_blocks` em `launch_fattn` (`fattn-common.hpp:1130,1155`) alem de `count-equal.cpp:48-59`.
 Nao mexer sem confirmar a contagem real e sem gatear por arquitetura.
+
+---
+
+## ADR-0007 - turbo4-K com V turbo mais barato (largura mista curada)
+
+**Data:** 2026-07-28
+**Status:** Aceito (validado na Arc B580, build-perf AOT bmg-g21)
+**Branch:** `feature/turbo4-k-mixed-width`
+
+### Contexto
+As medicoes de perplexidade do ADR-0006 estabeleceram que turbo no V custa ~0,4% e turbo no K custa
+~30%, e que **turbo4 e o joelho de qualidade no K** (turbo4 simetrico +5,1%, turbo3 simetrico +31,7%).
+Isso implica um ponto de fronteira que o turbo simetrico nao alcanca: turbo4 no K com um V mais
+barato. Essa combinacao nao existia.
+
+Pior: ela **ja era alcancavel e abortava**. O router aceita qualquer par com algum lado turbo
+(`fattn.cpp` `KV_is_turbo` -> `BEST_FATTN_KERNEL_VEC`) e `ggml_sycl_flash_attn_ext_supported` apenas
+consulta o router, entao o backend **anunciava suporte** para `-ctk turbo4 -ctv turbo3` e depois caia
+no `GGML_ABORT("Not match KV type in vec")` por falta de row curada. Nao e feature nova apenas; e
+conserto de um abort alcancavel em producao.
+
+### Decisao
+Adicionar duas rows curadas, `FATTN_VEC_CASES_TURBO_D(TURBO4_0, TURBO3_0)` e `(TURBO4_0, TURBO2_0)`,
+e um allowlist no shim de prefill para admitir exatamente esses dois pares de largura mista.
+
+**Zero arquivos de instancia**, e e aqui que isto diverge do ADR-0005. `TURBO4_0` nao aparece no eixo
+`type_K` do `EXTERN_DECL_FATTN_VEC_CASES` (`fattn-vec.hpp`), entao nenhum dos dois pares tem
+`extern template` suprimindo a instanciacao implicita - ambos instanciam na TU do `fattn.cpp`,
+exatamente como as rows `(TURBO4_0, TURBO4_0)` e `(TURBO4_0, Q8_0)` que ja enviam sem arquivo algum.
+O ADR-0005 precisou de `fattn-vec-instance-f16-tq3.cpp` so porque `(F16, TURBO3_0)` **estava**
+declarado extern. `GGML_SYCL_FA_ALL_QUANTS` continua OFF (ADR-0004); o link fecha sem LNK2019.
+
+**Armadilha registrada no codigo:** nao adicionar `EXTERN_DECL_FATTN_VEC_CASES(D, GGML_TYPE_TURBO4_0)`
+numa futura arrumacao - isso suprimiria a instanciacao implicita de todas as rows turbo4-K de uma vez
+e produziria LNK2019.
+
+Risco de recurso e nulo, e por um motivo estrutural: `nthreads_KQ` e `vec_dot_KQ` derivam so de
+`type_K`; `nthreads_V`, `V_rows_per_thread` e `dequantize_V` derivam so de `type_V`; e os branches
+`K_is_turbo`/`V_is_turbo` colapsam turbo2/3/4 num unico caso. Logo `(turbo4, turbo3)` tem footprint de
+registrador e SLM **identico** ao `(turbo4, turbo4)` que ja envia. So muda o codebook dentro das duas
+funcoes de dequant, e elas nunca se tocam no corpo do kernel.
+
+### Larguras reversas ficam de fora
+`(turbo3 K, turbo4 V)` custa exatamente os mesmos bytes que `(turbo4 K, turbo3 V)` - 118 B por 256
+valores - mas poe o quantizador grosseiro no lado que domina o erro. Estritamente dominado: mesma
+memoria, ~6x a penalidade de perplexidade. Mesmo argumento, pior, para qualquer par com turbo2 no K.
+
+### Evidencia (Arc B580, build-perf AOT, Qwen3-4B Q4_K_M)
+Perplexidade (wikitext-2, `-c 512 --chunks 32`, `TURBO_LAYER_ADAPTIVE=0`), e memoria KV @64k por
+aritmetica exata de bytes/bloco (conferida contra a tabela da secao 6 do deep-dive em f16, turbo3 e
+turbo4):
+
+| K x V | PPL | vs f16 9,054 | KV @64k | vs f16 |
+|-------|----:|-------------:|--------:|-------:|
+| q8_0 x turbo3   |  9,091 |  +0,4% | 3348 MiB | 2,75x |
+| turbo4 x turbo4 |  9,511 |  +5,1% | 2448 MiB | 3,76x |
+| **turbo4 x turbo3** | **9,564** | **+5,6%** | **2124 MiB** | **4,34x** |
+| **turbo4 x turbo2** | **9,724** | **+7,4%** | **1836 MiB** | **5,02x** |
+| turbo3 x turbo3 | 11,920 | +31,7% | 1800 MiB | 5,12x |
+
+`turbo4 x turbo3` **domina estritamente** o turbo4 simetrico: 15% menos KV por 0,5 ponto percentual.
+`turbo4 x turbo2` chega a praticamente a economia do turbo3 simetrico (5,02x vs 5,12x) com +7,4% em
+vez de +31,7%.
+
+Com o K fixo em turbo4 a degradacao do V e suave (9,511 -> 9,564 -> 9,724 de 4 para 3 para 2 bits),
+o que reconfirma que o V e quase de graca.
+
+- Golden `test-sycl-turbo` sob AOT: **71 PASSED / 0 FAILED**. Os pares novos medem rel-MSE **0,0** em
+  decode e em DECODE+GQA+padding-mask, e 1,5-2,7e-3 no caminho TILE.
+- e2e `test-e2e-turbo-kv.sh`: **11/11 coerentes** (as 9 anteriores mais os dois pares novos).
+
+### Nao e recomendacao de default
+O default de producao continua `-ctk q8_0 -ctv turbo3` (+0,4%). Estes pares custam ~5 pontos
+percentuais de perplexidade a mais; servem a quem precisa de contexto que nao cabe de outro jeito.
+
+### Achado colateral: o modo 8 ignora o `--cache-type-v`
+`llama-kv-cache.cpp`, branch do `adaptive_mode == 8`: nas camadas nao-fronteira ele faz
+`layer_type_v = GGML_TYPE_TURBO2_0` **incondicionalmente**, descartando o tipo que o usuario pediu.
+Medido: `-ctv` turbo2, turbo3 e turbo4 sob `TURBO_LAYER_ADAPTIVE=8` dao PPL identica ate a quarta casa
+(9,2754), porque sao literalmente a mesma configuracao. O modo 8 so auto-liga quando `type_v` ja e
+turbo2, entao o default nao e afetado - mas quem setar o env manualmente recebe um V diferente do que
+pediu, sem aviso. Nao corrigido aqui (mexe em politica de modo adaptativo, fora do escopo deste ADR).
+
+Isso tambem explica por que a tabela de memoria do deep-dive lista turbo2 em 816 MiB por lado e nao
+612: aquele numero ja embute as 4 camadas q8_0 do modo 8 (4x68 + 32x17 = 816).

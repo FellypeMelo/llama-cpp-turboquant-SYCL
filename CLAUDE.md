@@ -126,8 +126,10 @@ across work-groups. The turbo-vs-f16 gap at depth is therefore per-element **deq
 occupancy. (There is a `// todo` / commented `parallel_blocks = ntiles_KQ` knob near line 1150 tuned for f16.)
 
 **Adaptive modes** (`src/llama-kv-cache.cpp`): layer-adaptive quant selection. Mixed turbo-K/turbo-V of
-*different* bit-widths across a boundary caused SYCL FA aborts, so a symmetric "mode 8" keeps every layer
-same-typed. Context-shift is **gracefully disabled for turbo** (`get_can_shift()` returns false) because turbo
+*different* bit-widths used to abort in SYCL FA, so a symmetric "mode 8" keeps every layer same-typed.
+Since ADR-0007 the pairs `turbo4-K x {turbo3,turbo2}-V` are curated and work; every other mixed width
+still aborts. Note **mode 8 overrides `--cache-type-v` to turbo2** on non-boundary layers regardless of
+what was requested (it only auto-enables when `-ctv` is already turbo2, so the default is unaffected). Context-shift is **gracefully disabled for turbo** (`get_can_shift()` returns false) because turbo
 K-shift is unimplemented and there is no SYCL turbo<->f32 cast - it falls back instead of crashing.
 
 ## Performance picture (honest, Arc B580)

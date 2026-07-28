@@ -21,9 +21,13 @@
 #     -ctk f16  -ctv turbo{2,3,4}   (max-precision K; Q stays un-rotated when K is f16)
 # NOT gated (characterised in docs/BENCHMARKS.md):
 #   turbo2 with TURBO_LAYER_ADAPTIVE=0  -> degenerate repetition (needs boundary)
-#   TURBO_LAYER_ADAPTIVE=5/6/7          -> SYCL FA abort (mixed K/V turbo types)
+#   TURBO_LAYER_ADAPTIVE=5/6/7          -> SYCL FA abort for turbo-K widths other than turbo4
 #   mixed turbo-K / q8_0-V              -> runs but flagged unreliable in code
-#   turbo-K + turbo-V asymmetric        -> NEVER (never enable turbo-K + turbo-V together)
+#   mixed turbo-K + turbo-V, K != turbo4 -> SYCL FA abort (no curated vec row)
+#
+# Mixed-width turbo4-K + cheaper-turbo-V IS gated below. Perplexity says turbo on V costs ~0.4%
+# while turbo on K costs ~30%, and turbo4 is the quality knee on K, so turbo4-K x turbo3-V reaches
+# ~4.3x KV saving at turbo4-K quality - a point symmetric turbo cannot hit. See ADR-0007.
 #
 # REQUIREMENTS: Intel Arc GPU + oneAPI runtime on PATH (source setvars.bat first)
 #   + the pure-attention reference model (Qwen3-4B). Absent model -> SKIP (77).
@@ -155,6 +159,11 @@ run_one "q8_0-turbo4" q8_0 turbo4
 run_one "f16-turbo3"  f16  turbo3
 run_one "f16-turbo2"  f16  turbo2
 run_one "f16-turbo4"  f16  turbo4
+# Mixed-width turbo: turbo4 K (quality knee) + a cheaper turbo V. Both sides turbo, so the graph
+# rotates Q forward AND inverse-rotates the output - the only gated configs where both happen with
+# different block widths on each side.
+run_one "turbo4-turbo3" turbo4 turbo3
+run_one "turbo4-turbo2" turbo4 turbo2
 
 echo ""
 echo "========================================"
