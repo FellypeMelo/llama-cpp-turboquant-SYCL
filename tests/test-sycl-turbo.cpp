@@ -391,9 +391,12 @@ static bool run_wht_roundtrip_test(ggml_backend_t backend, int gs) {
 // the CUDA architecture (graph op = single rotation site, VEC kernel dequants V).
 static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type_K, ggml_type type_V, const char * name,
                                            void (*quant_ref_K)(const float *, void *, int64_t),
-                                           void (*quant_ref_V)(const float *, void *, int64_t), int n_q) {
+                                           void (*quant_ref_V)(const float *, void *, int64_t), int n_q,
+                                           int n_kv = 256) {
     const int D      = 128;   // head dim == QK_TURBO block size
-    const int n_kv   = 256;   // multiple of FATTN_KQ_STRIDE
+    // n_kv must be a multiple of FATTN_KQ_STRIDE. The default 256 gives ntiles_KQ = 2, which barely
+    // engages the split-KV path; pass a deep n_kv to force parallel_blocks > 1 in launch_fattn and
+    // exercise flash_attn_combine_results.
     const float scale = 1.0f / sqrtf((float) D);
     printf("Testing FA turbo golden parity: %s (D=%d, n_kv=%d, n_q=%d)...\n", name, D, n_kv, n_q);
     // n_q>1 exercises the vec kernel's cols_per_block>=2 (prefill) path, which only turbo hits
@@ -491,10 +494,30 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
         float rel_mse = mse / (nr / D + 1e-20f);
         worst_cos = std::min(worst_cos, cosine);
         worst_relmse = std::max(worst_relmse, rel_mse);
-        // n_q > 2 (prefill) now routes through the dequant-to-f16 + f16 TILE path on device
-        // (fattn.cpp ggml_sycl_flash_attn_ext_turbo_prefill), so it carries f16 KV precision
-        // (~2^-9 rel error) rather than the higher-precision turbo VEC path used for n_q==1 decode.
-        const float relmse_tol = (n_q > 2) ? 6e-3f : 1e-3f;
+        // The achievable rel-MSE depends on which device path this shape takes.
+        //  - f16 TILE, taken by ggml_sycl_flash_attn_ext_turbo_prefill (symmetric turbo above 2 Q
+        //    columns, asymmetric at 16 or more): carries f16 KV precision, ~2^-9 relative.
+        //  - turbo VEC with a quantized NON-turbo K (i.e. q8_0): fattn-vec.hpp:124 sets
+        //    Q_q8_1 = type_K != F16 && !K_is_turbo, so Q itself is quantized to q8_1 for the KQ
+        //    product. That costs a few percent per element and is upstream's design, not a turbo
+        //    defect. f16-K and turbo-K both skip it, which is why only q8_0-K needs the wider bound.
+        //    Cosine still has to clear 0.999, which is what actually catches structural breakage.
+        const bool k_is_turbo = type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 ||
+                                type_K == GGML_TYPE_TURBO4_0;
+        const bool v_is_turbo = type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0 ||
+                                type_V == GGML_TYPE_TURBO4_0;
+        // Mirrors ggml_sycl_flash_attn_ext_turbo_prefill: turbo V, no mixed turbo widths, 16 columns.
+        const bool uses_tile  = v_is_turbo && !(k_is_turbo && type_K != type_V) && n_q >= 16;
+        const bool q_is_q8_1  = !uses_tile && type_K != GGML_TYPE_F16 && !k_is_turbo;
+        // A q8_0 V also takes a different dequant path in the vec kernel than a turbo V, and the
+        // AOT (bmg-g21) compiler schedules it with slightly wider error than the JIT: the same
+        // turbo-K x q8_0-V cases measure 0.0 under build-sync and 1.2-1.4e-3 under build-perf,
+        // with cosine holding at 0.999995. That is arithmetic scheduling, not a structural
+        // difference, so the bound has to admit it or the gate only passes on one build flavor.
+        const bool v_is_q8_0 = type_V == GGML_TYPE_Q8_0;
+        const float relmse_tol = q_is_q8_1 ? 8e-2f
+                               : (n_q > 2  ? 6e-3f
+                               : (v_is_q8_0 ? 2e-3f : 1e-3f));
         bool col_ok = !(std::isnan(cosine) || std::isnan(rel_mse)) && cosine >= 0.999f && rel_mse <= relmse_tol;
         if (!col_ok) {
             pass = false;
@@ -829,9 +852,14 @@ int main() {
     success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref, 1);
     success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, quantize_row_turbo2_0_ref, 1);
     success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, quantize_row_turbo4_0_ref, 1);
-    // n_q>1 exercises the vec cols_per_block>=2 (prefill) path that only turbo uses:
+    // n_q>1 exercises the vec cols_per_block>=2 path that only turbo uses. The prefill shim declines
+    // below 16 columns, so n_q=8 is VEC and n_q=16 is the dequant-to-f16 + f16 TILE path; symmetric
+    // turbo needs both, same as the asymmetric pairs below.
     success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref, 8);
     success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, quantize_row_turbo2_0_ref, 8);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0", quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref, 16);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, "TURBO2_0", quantize_row_turbo2_0_ref, quantize_row_turbo2_0_ref, 16);
+    success &= run_fattn_turbo_golden_test_nq(backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, "TURBO4_0", quantize_row_turbo4_0_ref, quantize_row_turbo4_0_ref, 16);
 
     // DECODE reproduction: GQA + padding mask (the real "1111" generation path).
     printf("\n=== FA turbo DECODE + GQA + padding-mask (real-model repro) ===\n");
@@ -865,6 +893,47 @@ int main() {
     printf("\n=== FA turbo DECODE+GQA+padding-mask, ASYMMETRIC precise-K x turbo-V ===\n");
     for (const auto & c : asym_cfgs)
         success &= run_fattn_turbo_decode_mask_gqa(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V);
+
+    // The shim switches kernels at 16 Q columns: below that it declines and turbo VEC runs (batched
+    // decode must not drag the whole cache through a dequant), at 16 and above it dequantizes to
+    // f16 scratch and the f16 TILE runs. Cover both sides - two different kernels that must reach
+    // the same answer.
+    printf("\n=== FA turbo golden parity, ASYMMETRIC precise-K x turbo-V (n_q=8, below threshold -> VEC) ===\n");
+    for (const auto & c : asym_cfgs)
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 8);
+    printf("\n=== FA turbo golden parity, ASYMMETRIC precise-K x turbo-V (n_q=16, at threshold -> f16 TILE) ===\n");
+    for (const auto & c : asym_cfgs)
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 16);
+
+    // Reverse asymmetry (turbo K + q8_0 V) is curated in the vec table but is deliberately REFUSED
+    // by the prefill shim (it requires a turbo V), so both column counts below stay on VEC. These
+    // cases had no coverage at all before; they pin the path the shim declines to take.
+    const asym_cfg rev_cfgs[] = {
+        { GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0, "TURBO2_0xq8_0", quantize_row_turbo2_0_ref, quantize_row_q8_0_ref_wrap },
+        { GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0, "TURBO3_0xq8_0", quantize_row_turbo3_0_ref, quantize_row_q8_0_ref_wrap },
+        { GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, "TURBO4_0xq8_0", quantize_row_turbo4_0_ref, quantize_row_q8_0_ref_wrap },
+    };
+    printf("\n=== FA turbo golden parity, ASYMMETRIC turbo-K x q8_0-V (VEC only, n_q=1 and n_q=8) ===\n");
+    for (const auto & c : rev_cfgs) {
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1);
+        success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 8);
+    }
+    // Deep context. Every case above runs at n_kv=256, i.e. ntiles_KQ=2, so launch_fattn almost
+    // never picks parallel_blocks > 1 and flash_attn_combine_results stays largely unexercised.
+    // n_kv=8192 gives ntiles_KQ=64 for the vec kernel (nbatch_fa = D = 128), which is where split-KV
+    // decode actually lives in a long-context run.
+    printf("\n=== FA turbo golden parity, DEEP CONTEXT n_kv=8192 (split-KV / combine path) ===\n");
+    {
+        const asym_cfg deep_cfgs[] = {
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0",     quantize_row_turbo3_0_ref, quantize_row_turbo3_0_ref },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
+            { GGML_TYPE_F16,      GGML_TYPE_TURBO3_0, "f16xTURBO3_0",  quantize_row_f16_ref_wrap,  quantize_row_turbo3_0_ref },
+        };
+        for (const auto & c : deep_cfgs) {
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  8192);
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 16, 8192);
+        }
+    }
     // TURBO END
 
     success &= run_fattn_turbo_smoke_test(backend);
