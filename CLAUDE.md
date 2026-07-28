@@ -147,7 +147,7 @@ K-shift is unimplemented and there is no SYCL turbo<->f32 cast - it falls back i
   ADR-0006 "Adiado".
 - **KV memory @64k:** turbo2 5.6x, turbo3 5.1x, turbo4 3.8x less than fp16 (q8_0 only 1.9x).
 
-## Key decisions and why (full ADRs in `docs/DECISIONS.md`)
+## Key decisions and why (full ADRs in `docs/pt-BR/decisions.md`)
 
 - **ADR-0001 - upstream sync via `merge`, not `rebase`.** The fork is ~230 custom commits over a merge-base
   2.5 months behind; rebasing would replay each turbo commit against 1075 upstream commits and reconflict the
@@ -186,7 +186,7 @@ K-shift is unimplemented and there is no SYCL turbo<->f32 cast - it falls back i
 | CLI type parsing (`turbo2`/`turbo3`/`turbo4`) | `common/arg.cpp` |
 | Tests / gates | `tests/test-sycl-turbo.cpp`, `tests/test-e2e-turbo-kv.sh`, `scripts/turbo-quality-gate.sh` |
 | CI/CD (Windows+Linux SYCL, release packaging) | `.github/workflows/tqp-sycl.yml` |
-| Engineering deep-dive / ADRs / benchmarks | `docs/TURBOQUANT_SYCL.md`, `docs/DECISIONS.md`, `docs/BENCHMARKS.md` |
+| Engineering deep-dive / ADRs / benchmarks | `docs/en/architecture.md`, `docs/{en,pt-BR}/decisions.md`, `docs/{en,pt-BR}/benchmarks.md` |
 | Session handoff (read at session start) | `TURBO_HANDOFF.md` |
 
 ## Running turbo
