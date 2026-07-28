@@ -7,7 +7,7 @@
 ## ADR-0001 — Estratégia de sync com upstream (2026-07): MERGE, não rebase
 
 **Data:** 2026-07-09
-**Status:** Aceito (parcial — sync ainda não concluído, ver `docs/UPSTREAM_SYNC.md`)
+**Status:** Aceito (parcial — sync ainda não concluído, ver `docs/pt-BR/upstream-sync.md`)
 **Branch:** `sync/upstream-2026-07` (criado de `feature/turboquant-kv-cache` @ `5874b9fe1`)
 
 ### Contexto
@@ -25,7 +25,7 @@ Motivos:
 2. Merge preserva a história turbo intacta (não reescreve os 230 commits) — importante para auditoria e para o CI/release existente.
 3. A re-integração turbo precisa de visão do estado FINAL de cada arquivo (ours vs theirs vs base-3), que o merge diff3 dá diretamente.
 
-Trade-off aceito: histórico fica com um merge commit "grande"; mitigado por este ADR + `UPSTREAM_SYNC.md` documentando o que entrou.
+Trade-off aceito: histórico fica com um merge commit "grande"; mitigado por este ADR + `docs/pt-BR/upstream-sync.md` documentando o que entrou.
 
 ---
 
@@ -36,12 +36,12 @@ Trade-off aceito: histórico fica com um merge commit "grande"; mitigado por est
 
 ### Contexto
 - Sessão escopada como **preparação e análise de risco**, explicitamente NÃO o rebase completo às cegas.
-- Trial-merge executado: **31 arquivos em conflito** (bounded, caracterizado — ver mapa em `UPSTREAM_SYNC.md`). Muitos arquivos hot auto-mergearam textualmente (`ggml.c`, `llama-graph.cpp`, `ggml-common.h`).
+- Trial-merge executado: **31 arquivos em conflito** (bounded, caracterizado — ver mapa em `docs/pt-BR/upstream-sync.md`). Muitos arquivos hot auto-mergearam textualmente (`ggml.c`, `llama-graph.cpp`, `ggml-common.h`).
 - **Toolchain SYCL indisponível nesta sessão:** oneAPI 2026.0 está instalado em `C:\Program Files (x86)\Intel\oneAPI` mas `icx`/`icpx` não estão no PATH (setvars não sourced), e de todo modo **não dá para buildar uma árvore mid-merge** com 31 conflitos abertos.
 - Regra do dono: **NÃO declarar sucesso sem validação**; perder turbo = falha total.
 
 ### Decisão
-Após o trial-merge caracterizar o risco, **`git merge --abort`** — deixar a árvore de trabalho LIMPA (branch `sync/upstream-2026-07` de volta em `5874b9fe1`), e entregar um **playbook determinístico** de resolução em `UPSTREAM_SYNC.md`.
+Após o trial-merge caracterizar o risco, **`git merge --abort`** — deixar a árvore de trabalho LIMPA (branch `sync/upstream-2026-07` de volta em `5874b9fe1`), e entregar um **playbook determinístico** de resolução em `docs/pt-BR/upstream-sync.md`.
 
 Motivos (escolha de engenharia sênior, deliberada):
 1. **Nenhuma resolução minha seria validável nesta sessão** (sem build). Assar decisões semânticas turbo (re-integração de dispatch SYCL, refactor `n_layer`, guards de tipo) não-validadas numa árvore parcial que ficaria dias parada = risco de bug silencioso herdado — exatamente o que o dono proíbe.

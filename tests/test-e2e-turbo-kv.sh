@@ -19,7 +19,7 @@
 #   ASYMMETRIC (precise K + turbo V; "V is free, K is everything"):
 #     -ctk q8_0 -ctv turbo{2,3,4}   (recommended prod default; K protected at 8-bit)
 #     -ctk f16  -ctv turbo{2,3,4}   (max-precision K; Q stays un-rotated when K is f16)
-# NOT gated (characterised in docs/BENCHMARKS.md):
+# NOT gated (characterised in docs/en/benchmarks.md / docs/pt-BR/benchmarks.md):
 #   turbo2 with TURBO_LAYER_ADAPTIVE=0  -> degenerate repetition (needs boundary)
 #   TURBO_LAYER_ADAPTIVE=5/6/7          -> SYCL FA abort for turbo-K widths other than turbo4
 #   mixed turbo-K / q8_0-V              -> runs but flagged unreliable in code
