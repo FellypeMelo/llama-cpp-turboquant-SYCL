@@ -186,8 +186,15 @@ jobs:
             (llama-cli, llama-server, llama-bench, llama-quantize + bundled oneAPI runtime
             DLLs). Unzip and run; no oneAPI install required. Needs an Intel GPU driver.
 
-            KV-cache quant types: `turbo2_0` / `turbo3_0` / `turbo4_0` via `-ctk`/`-ctv`
-            (e.g. `-fa 1 -ctk turbo3_0 -ctv turbo3_0`) for 3.8–5.6x KV memory savings.
+            KV-cache quant types: `turbo2` / `turbo3` / `turbo4` via `-ctk`/`-ctv`, and they
+            require flash-attention. The recommended configuration keeps K precise and compresses
+            V, because quantizing V costs ~0.4% perplexity while quantizing K costs ~30%:
+
+                llama-server -m model.gguf -ngl 99 --flash-attn on \
+                             --cache-type-k q8_0 --cache-type-v turbo3 -c 32768
+
+            Symmetric turbo maximises the KV saving (up to 5.1x) but costs ~32% perplexity at
+            turbo3. See docs/TURBOQUANT_SYCL.md before choosing it.
           files: ./release/**/*
           draft: false
           prerelease: false

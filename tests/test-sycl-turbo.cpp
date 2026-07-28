@@ -201,7 +201,7 @@ static bool run_weight_test(ggml_backend_t backend, ggml_type type, const char *
 
 // Reference sign array for the TQ weight (group_size == 32) WHT rotation.
 // Values copied from ggml-turbo-quant.c's TQ3_0_SIGNS / ggml-cuda's TQ_WEIGHT_SIGNS /
-// ggml-sycl's TQ_SIGNS — all three must be identical for the rotation to be correct.
+// ggml-sycl's TQ_SIGNS - all three must be identical for the rotation to be correct.
 static const float kTqSigns32[32] = {
     +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
     -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
@@ -642,7 +642,7 @@ static bool run_set_rows_multi_test(ggml_backend_t backend, ggml_type type, cons
     return pass;
 }
 
-// BISECT TEST D: faithful DECODE reproduction — GQA (n_head > n_head_kv) + a PADDING MASK where the
+// BISECT TEST D: faithful DECODE reproduction - GQA (n_head > n_head_kv) + a PADDING MASK where the
 // KV cache is allocated to n_kv rows but only the first `seq_len` are valid; rows [seq_len, n_kv) are
 // padding whose K/V is uninitialized garbage and MUST be excluded via a -inf mask. This is exactly
 // the real-model generation path ("1111" degenerate output) that NO existing test exercises: the FA

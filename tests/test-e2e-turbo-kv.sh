@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# test-e2e-turbo-kv.sh  —  END-TO-END turbo KV-cache COHERENCE gate (SYCL/Arc)
+# test-e2e-turbo-kv.sh  -  END-TO-END turbo KV-cache COHERENCE gate (SYCL/Arc)
 # =============================================================================
 # Proves the RECOMMENDED, SYCL-safe turbo KV-cache configs generate COHERENT
 # text in REAL end-to-end llama-cli generation (NOT kernel numeric parity).
@@ -168,11 +168,11 @@ run_one "turbo4-turbo2" turbo4 turbo2
 echo ""
 echo "========================================"
 if [ "$FAIL" -eq 0 ]; then
-    echo "  ALL turbo KV configs generated COHERENT text — PASS"
+    echo "  ALL turbo KV configs generated COHERENT text - PASS"
     echo "========================================"
     exit 0
 else
-    echo "  turbo KV coherence FAILED — DO NOT SHIP"
+    echo "  turbo KV coherence FAILED - DO NOT SHIP"
     echo "========================================"
     exit 1
 fi

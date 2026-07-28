@@ -1,0 +1,159 @@
+name: TurboQuant+ gates
+
+# Correctness gates, split by what the runner can actually do.
+#
+#   static     - hosted, ~1 min, runs on everything. Catches the class of defect that has actually
+#                shipped in this fork: invariants kept in sync by a comment instead of by a tool.
+#   gpu-gates  - self-hosted with an Intel Arc. The golden numeric parity test and the e2e coherence
+#                gate are the only things that can prove a turbo change is correct, and neither can
+#                run on a GitHub-hosted runner because there is no Intel GPU there.
+#   quality    - self-hosted, manual or nightly. Perplexity is slow and needs wikitext-2 plus the
+#                reference model, so it does not belong in the per-push path.
+#
+# The GPU jobs are gated on the repository variable HAS_ARC_RUNNER so that the workflow degrades to
+# "static only" instead of queueing forever against a runner label that does not exist. Set
+# HAS_ARC_RUNNER=true and give the runner the label `arc-b580` to switch them on.
+
+on:
+  push:
+    branches:
+      - feature/**
+      - sync/**
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly, 04:00 UTC. Only the quality job keys off this.
+    - cron: '0 4 * * *'
+
+concurrency:
+  group: tqp-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: static invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: FA dispatch lockstep
+        # Three places have to agree about which KV type pairs are dispatchable. A drift between the
+        # prefill shim and the curated decode table means prefill succeeds and the abort lands on
+        # the first decode token, after the whole prompt was processed. That bug has shipped here
+        # before and was caught by review, not by a test.
+        run: python3 scripts/check-fattn-lockstep.py
+
+      - name: ASCII only in changed code
+        # AGENTS.md requires ASCII in code. Scoped to files this change actually touches: the
+        # upstream tree carries pre-existing non-ASCII that is not ours to churn, and a gate that
+        # is red on arrival gets ignored. Prose docs are exempt on purpose - they contain accented
+        # Portuguese by design.
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base=$(git merge-base origin/${{ github.base_ref }} HEAD)
+          else
+            base=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+          fi
+          changed=$(git diff --name-only --diff-filter=d "$base" HEAD \
+                    | grep -E '\.(c|h|cpp|hpp|sh|py)$' || true)
+          if [ -z "$changed" ]; then echo "no code files changed"; exit 0; fi
+          bad=0
+          for f in $changed; do
+            [ -f "$f" ] || continue
+            if LC_ALL=C grep -nP '[^\x00-\x7F]' "$f" > /tmp/hits 2>/dev/null; then
+              echo "non-ASCII in $f:"; head -5 /tmp/hits; bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo ""
+            echo "Use - -> x ... instead of em-dash, unicode arrows, multiplication sign, ellipsis."
+            exit 1
+          fi
+          echo "OK: no non-ASCII in the changed code files"
+
+      - name: Shell scripts parse
+        run: |
+          set -euo pipefail
+          for f in $(git ls-files 'tests/*.sh' 'scripts/*.sh'); do
+            bash -n "$f" || { echo "syntax error in $f"; exit 1; }
+          done
+          echo "OK: all shell scripts parse"
+
+      - name: Gate scripts degrade instead of crashing
+        # A gate that dies on a missing dependency is indistinguishable from a gate that fails.
+        # Both of these must exit 77 (SKIP) when the model or binaries are absent, which is exactly
+        # the situation on a hosted runner.
+        run: |
+          set -uo pipefail
+          for s in scripts/turbo-quality-gate.sh tests/test-e2e-turbo-kv.sh; do
+            bash "$s" >/tmp/out 2>&1; rc=$?
+            if [ "$rc" -ne 77 ]; then
+              echo "$s exited $rc, expected 77 (SKIP) with no model/binaries present:"
+              tail -20 /tmp/out
+              exit 1
+            fi
+            echo "OK: $s -> 77 SKIP"
+          done
+
+  gpu-gates:
+    name: golden + e2e on Arc
+    if: ${{ vars.HAS_ARC_RUNNER == 'true' }}
+    runs-on: [self-hosted, windows, arc-b580]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build (AOT bmg_g21)
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          cmake -G Ninja -B build-ci ^
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON ^
+            -DGGML_SYCL_DEVICE_ARCH=bmg-g21 -DLLAMA_CURL=OFF
+          cmake --build build-ci --config Release -j 8 ^
+            --target llama-cli llama-bench llama-perplexity test-sycl-turbo
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+      - name: Golden numeric parity
+        # The primary gate. CPU golden vs SYCL kernel in the rotated domain.
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          set SYCL_CACHE_PERSISTENT=1
+          build-ci\bin\test-sycl-turbo.exe
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+      - name: E2E coherence
+        # Exit 77 means the reference model is absent on the runner. That is a real gap, not a pass,
+        # so surface it loudly rather than letting the job go green on a skip.
+        shell: bash
+        run: |
+          set -uo pipefail
+          TURBO_E2E_MODEL="${TURBO_E2E_MODEL:-G:/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf}" \
+            bash tests/test-e2e-turbo-kv.sh
+          rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "::error::e2e SKIPPED - the reference model is missing on this runner."
+            exit 1
+          fi
+          exit $rc
+
+  quality:
+    name: perplexity budget
+    # Slow, and it currently fails on purpose: symmetric turbo3 is ~32% over the q8_0 baseline.
+    # Kept off the per-push path and non-blocking until the recommendation question is settled.
+    if: ${{ vars.HAS_ARC_RUNNER == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: [self-hosted, windows, arc-b580]
+    continue-on-error: true
+    timeout-minutes: 240
+    needs: [gpu-gates]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Quality + speed gate
+        shell: bash
+        run: |
+          LLAMA="$PWD/build-ci/bin" CHUNKS=32 bash scripts/turbo-quality-gate.sh
