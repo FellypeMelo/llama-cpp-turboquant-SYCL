@@ -79,6 +79,27 @@ Correct because turbo already stores rotated values (Q is graph-rotated, output 
 
 Decode stays on VEC, so the memory saving is fully preserved.
 
+### Asymmetric KV had been left out of this (fixed 2026-07-28)
+
+The gate above was written as *symmetric* turbo only — `is_turbo(K) && is_turbo(V) && K->type == V->type`. But the production default this project recommends is `-ctk q8_0 -ctv turbo3`, which is **asymmetric**, so it never reached Option A at all: the router forces VEC for anything turbo (`fattn.cpp:297-299`), and VEC is decode-shaped. Asymmetric prefill was therefore running at roughly **an eighth of f16** while symmetric sat at parity.
+
+The shim now requires only a **turbo V**, with K in `{f16, q8_0, turbo}`; each non-f16 side gets a contiguous f16 shadow and an already-f16 side passes through untouched. Measured on the B580 (build-perf AOT, Qwen3-4B Q4_K_M, `llama-bench -fa 1 -r 2`), `-ctk q8_0 -ctv turbo3`:
+
+| test | before | after | gain | f16 ceiling |
+|------|-------:|------:|-----:|------------:|
+| pp512 | 630.2 | **2540.0** | 4.0× | 2582.0 |
+| pp2048 | 299.2 | **1766.3** | 5.9× | 1768.9 |
+| pp8192 | 95.7 | **798.0** | 8.3× | 798.5 |
+
+That is 98.4–99.9% of f16, and slightly *ahead* of symmetric turbo3 (2487 / 1736 / 791) because dequantizing a `q8_0` K is cheaper than a turbo3 one.
+
+Two guards matter:
+
+- **16-column threshold, applied uniformly.** The shim dequantizes the **whole** K/V cache, so it only pays off once enough Q columns amortize that pass. Under a unified cache the server default (`n_parallel = 4`, `kv_unified = true`) packs every slot into one ubatch, so batched decode presents `Q->ne[1] >= 3` with `K->ne[3] == 1` — without the threshold, every decode step would drag the entire cache through a dequant to serve three or four columns. This bound is a property of the shim, not of the K type, so symmetric turbo gets it too.
+- **No mixed turbo widths.** `turbo2` K with `turbo3` V has no vec instance, so it must not reach prefill — otherwise the prompt processes fine and the abort lands on the first decode token instead.
+
+Full detail, plus the `Q_q8_1` accuracy finding that came out of this, is in `docs/DECISIONS.md` ADR-0006.
+
 ## 5. The bugs that stood between "compiles" and "correct"
 
 Low-bit rotated KV is unforgiving — an off-by-one in a packed-bit stride silently corrupts the cache. The hard-won fixes:
@@ -105,6 +126,31 @@ Savings vs fp16 @64k: **turbo2 5.6×** (adaptive mode 8; pure turbo2 = 7.5×), *
 
 **Prefill / decode (llama-bench, -fa 1):** prefill matches fp16 at every length (§4). Decode at shallow context is near-fp16 (turbo3 tg128 70.4 vs f16 75.6).
 
+### Quality: put turbo on V, not on K (measured 2026-07-28)
+
+The first live run of `scripts/turbo-quality-gate.sh` produced the numbers below — wikitext-2, Qwen3-4B Q4_K_M, `-c 512 --chunks 32`, B580 build-perf AOT. Until now this gate had never actually executed (it pointed at dead paths and compared against a hardcoded `BASELINE_PPL`), so these are the first perplexity measurements this fork has.
+
+| `-ctk` | `-ctv` | PPL | vs f16 |
+|--------|--------|----:|-------:|
+| f16 | f16 | 9.054 | — |
+| q8_0 | q8_0 | 9.045 | −0.1% |
+| **q8_0** | **turbo3** | **9.091** | **+0.4%** |
+| **f16** | **turbo3** | **9.104** | **+0.6%** |
+| turbo4 | turbo4 | 9.511 | +5.1% |
+| turbo3 | q8_0 | 11.781 | +30.1% |
+| turbo3 | turbo3 | 11.920 | +31.7% |
+| turbo2 | turbo2 | 12.821 | +41.6% |
+
+The `turbo3 x q8_0` and `q8_0 x turbo3` rows isolate the cause: **turbo3 on V costs 0.4%; turbo3 on K costs 30%.** That is a ~75× asymmetry, and it is qualitatively what the KV-quantization literature predicts — K error passes through the softmax exponential, V error only enters a linear average.
+
+Consequences, stated plainly:
+
+- **`-ctk q8_0 -ctv turbo3` is the configuration to use.** It is within 0.5% of f16 perplexity, runs prefill at f16 parity (§4), and still removes most of the V-side cache.
+- **Symmetric `turbo3` is not "near-fp16 quality."** Earlier revisions of this document said so; the measurement does not support it. `turbo4` is the only symmetric format that stays within a 5% budget.
+- The golden numeric tests **cannot** catch this. They compare the device kernel against a CPU golden computed from the *same quantized* K/V, so quantization error cancels on both sides — they measure kernel fidelity, not quantization quality. Only perplexity sees it.
+
+One open question, not resolved: the step from `turbo4` (+5.1%) to `turbo3` (+31.7%) is steep for 1.1 bits, while `turbo3` to `turbo2` only adds ~10 points. `turbo4` uses PolarQuant while `turbo2`/`turbo3` use centroid codebooks, so the 8-level `turbo3` codebook may be underperforming what 3 bits should deliver. Degradation is monotonic in bit-width, which argues for a format property rather than a kernel defect, but this has not been run down.
+
 **Decode at depth — the honest limitation:**
 
 | depth | f16 | turbo3 | q8_0 |
@@ -113,7 +159,16 @@ Savings vs fp16 @64k: **turbo2 5.6×** (adaptive mode 8; pure turbo2 = 7.5×), *
 | 8k | 57.6 | 28.9 | 26.1 |
 | 32k | 33.9 | 10.1 | 8.9 |
 
-Turbo decode slows at deep context — **but this is not a TurboQuant defect.** `q8_0` collapses *identically* (turbo3 actually beats it at depth). The bottleneck is the per-element dequant inside the VEC inner loop, inherent to **all** quantized-KV decode; f16 stays fast only because it skips dequant. So turbo delivers `q8_0`-class decode speed **at up to 2.7× less memory than `q8_0`** — that is the win. Closing the f16 gap at depth would need a fundamentally different decode kernel (the CUDA VEC path doesn't either).
+Turbo decode slows at deep context — **but this is not a TurboQuant defect.** `q8_0` collapses *identically* (turbo3 actually beats it at depth). So turbo delivers `q8_0`-class decode speed **at up to 2.7× less memory than `q8_0`** — that is the win.
+
+**Correction (2026-07-28):** earlier revisions of this document attributed the gap to per-element dequant being *inherent* to quantized-KV decode. That is not the whole story, and the "inherent" framing is wrong. The measured asymmetry is structural:
+
+- f16 decode with GQA satisfies `gqa_opt_applies` and routes to the **GQA-batched TILE** kernel (`fattn.cpp:305-318`), which loads each K/V row **once** and reuses it across the whole GQA group.
+- Every quantized type — turbo *and* `q8_0` — is forced onto **VEC**, and VEC hard-codes its GQA batching factor: `launch_fattn<D, cols_per_block, 1, ...>` at `fattn-vec.hpp:632`, where that literal `1` is the `ncols2` template parameter.
+
+So VEC re-dequantizes each K/V row **once per query head in the GQA group** — a ~4× redundant dequant on the reference model (GQA 4:1). That is an addressable structural gap, not a law of nature, and it explains why f16 and quantized diverge specifically at depth.
+
+It is **not** a free fix. A read-only design pass established that `launch_fattn` and the split-KV / `flash_attn_combine_results` path are already `ncols2`-aware, so the work is confined to the VEC kernel's head/sequence index decode — but register pressure is the binding constraint. At D=128 with turbo-V, `nthreads_V = 2` (`fattn-vec.hpp:113-115`) inflates the `VKQ` accumulator to ~64 dwords/lane, so `ncols2 = 2` only fits if `nthreads_V` is retuned upward at the same time, and `ncols2 = 4` does not fit at all. Intel GRF spills are the known failure mode here. Treat the numbers above as the current state, not the ceiling; see `docs/DECISIONS.md` ADR-0006.
 
 ## 7. What was explored and consciously deferred
 
@@ -132,10 +187,13 @@ Turbo decode slows at deep context — **but this is not a TurboQuant defect.** 
 ## 9. Using it
 
 ```bash
-# Turbo KV cache — requires flash-attention
+# Turbo KV cache — requires flash-attention.
+# Keep K precise and compress V: within 0.5% of f16 perplexity (§6).
 llama-server -m model.gguf -ngl 99 --flash-attn on \
-             --cache-type-k turbo3 --cache-type-v turbo3 -c 32768
+             --cache-type-k q8_0 --cache-type-v turbo3 -c 32768
 ```
+
+Symmetric turbo (`-ctk turbo3 -ctv turbo3`) maximizes memory savings but costs ~32% perplexity — see §6 before choosing it. If you need symmetric, `turbo4` is the only one inside a 5% budget.
 
 Accepted `--cache-type-k` / `-v` strings: **`turbo2`**, **`turbo3`**, **`turbo4`**. Requires `--flash-attn on`. On Intel GPUs set `SYCL_CACHE_PERSISTENT=1` once so the SYCL JIT caches kernels to disk (first launch compiles all kernels — otherwise startup looks slow).
 
