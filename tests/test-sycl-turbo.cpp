@@ -1027,15 +1027,24 @@ int main() {
         }
     }
 
-    // head_dim 512 is NOT covered, and is BROKEN independently of this change. Reproduced
-    // 2026-07-29 on an Arc B580 by adding f16xf16 and q8_0xq8_0 at D=512, n_q=1: cosine 0.039 and
-    // 0.047, rel-MSE 2.8e7 and 4.6e7. It was already broken before the host/kernel nthreads fix in
-    // this change (the host launched 128 threads while the kernel assumed max(128,512) = 512, a 4x
-    // mismatch), and it stays broken after, so a third D=512-specific cause remains unfound.
-    // FATTN_VEC_CASES_ALL_D has always emitted these instances and the router reaches them, so any
-    // head_dim-512 model on the SYCL vec path is affected - this is not turbo-specific.
-    // Upstream c1063ac9d sidesteps it by pinning 128 threads at D=512. Re-add these two cases when
-    // someone takes that on; they fail loudly and immediately.
+    // head_dim 512, non-turbo (FATTN_VEC_CASES_TURBO_D stops at 256). These measured cosine 0.039
+    // and 0.047 - garbage - until nthreads was capped at 256. The cause was the work-group size:
+    // nthreads was max(128, D) = 512 there, and the maximum a device grants a kernel shrinks with
+    // its register pressure, which at D=512 is already near the per-lane budget from Q_reg plus
+    // VKQ. Shared memory was never the problem (16 KB at D=512, far under the ceiling) and neither
+    // was KQ indexing; both were measured and eliminated first.
+    // Not turbo-specific: FATTN_VEC_CASES_ALL_D has always emitted these instances and the router
+    // reaches them, so every head_dim-512 model on the SYCL vec path was affected.
+    printf("\n=== FA golden parity, head_dim 512 (non-turbo) ===\n");
+    {
+        const asym_cfg d512_cfgs[] = {
+            { GGML_TYPE_F16,  GGML_TYPE_F16,  "f16xf16",   quantize_row_f16_ref_wrap,  quantize_row_f16_ref_wrap },
+            { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "q8_0xq8_0", quantize_row_q8_0_ref_wrap, quantize_row_q8_0_ref_wrap },
+        };
+        for (const auto & c : d512_cfgs) {
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 512);
+        }
+    }
 
     // logit_softcap. Half of every compiled vec instance carries use_logit_softcap=true as a template
     // parameter, and before this block not one of them had ever been executed by a test - the kernel

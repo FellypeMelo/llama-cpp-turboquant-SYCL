@@ -103,7 +103,14 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO4_0);
     constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
 
-    constexpr int nthreads    = (ggml_sycl_fattn_vec_get_nthreads_device() > D ? ggml_sycl_fattn_vec_get_nthreads_device() : D);
+    // Capped at 256. The kernel handles nthreads < D through the strided i0 loops, and a
+    // 512-thread work-group is where D=512 produces garbage (golden cosine 0.039): the device
+    // max work-group size shrinks with register pressure, and at D=512 Q_reg plus VKQ already
+    // sit near the per-lane budget. Upstream c1063ac9d caps the same case for the same reason.
+    // Both this and the host-side computation below must yield the same value.
+    constexpr int nthreads_uncapped = (ggml_sycl_fattn_vec_get_nthreads_device() > D
+                                       ? ggml_sycl_fattn_vec_get_nthreads_device() : D);
+    constexpr int nthreads    = nthreads_uncapped > 256 ? 256 : nthreads_uncapped;
     // Turbo K uses the same cooperative split as F16 (128/cpy_nb lanes per K-row): the turbo vec_dot
     // now dequant+dots only its D/nthreads_KQ slice of the pre-rotated Q and the caller sub-group-
     // reduces the partials. This shrinks Q_reg from the whole D (nthreads_KQ=1, which spilled the
@@ -665,7 +672,8 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
     // threads had written. Results were garbage (golden cosine near zero) for every type, not just
     // turbo. At D<=128 both sides yield 128, which is why this stayed invisible.
     const int nthreads_host = ggml_sycl_fattn_vec_get_nthreads_host(cc);
-    const int nthreads = nthreads_host > D ? nthreads_host : D;
+    const int nthreads_uncapped = nthreads_host > D ? nthreads_host : D;
+    const int nthreads = nthreads_uncapped > 256 ? 256 : nthreads_uncapped;  // see the kernel-side cap
     const int nwarps   = nthreads / warp_size;
 
     const bool need_f16_K = type_K == GGML_TYPE_F16;
