@@ -432,9 +432,10 @@ Isso tambem explica por que a tabela de memoria do deep-dive lista turbo2 em 816
 ## ADR-0008 - head_dim fora de {64,128}: o fallback silencioso para CPU
 
 **Data:** 2026-07-29
-**Status:** Aceito, mas **parcialmente superado pelo ADR-0009** - D=256 passou a ser suportado.
-O mecanismo do fallback silencioso descrito aqui continua valendo para head_dim fora de
-{64,128,256}, e D=512 continua quebrado.
+**Status:** Aceito, mas **superado nas duas afirmacoes de cobertura**: o ADR-0009 acrescentou
+D=256 ao turbo e o ADR-0010 consertou D=512 para os tipos nao-turbo. O mecanismo do fallback
+silencioso descrito aqui continua valendo - ele e sobre o que acontece quando o router devolve
+NONE, nao sobre quais head dims sao cobertos.
 
 ### O mecanismo, que e o ponto principal
 `ggml_sycl_flash_attn_ext_supported` e literalmente

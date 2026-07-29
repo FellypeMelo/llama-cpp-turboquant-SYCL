@@ -202,10 +202,11 @@ perplexity gate): turbo on **V** costs ~0.4%; turbo on **K** costs ~30%. PPL vs 
 symmetric turbo2/turbo3**; `-ctk q8_0 -ctv turboN` is the config. Note the golden tests are structurally
 blind to this (they quantize both sides identically, so quant error cancels) - only perplexity sees it.
 
-**head_dim must be 64, 128 or 256** - that is what `FATTN_VEC_CASES_TURBO_D` covers. **512 is broken**,
-and not only for turbo: `f16 x f16` and `q8_0 x q8_0` measure cosine 0.039 and 0.047 there, a third
-D=512-specific cause is still unfound, and the reproduction sits in a comment in
-`tests/test-sycl-turbo.cpp`.
+**Turbo covers head_dim 64, 128 and 256** - that is what `FATTN_VEC_CASES_TURBO_D` emits. Non-turbo
+types additionally reach 512 through `FATTN_VEC_CASES_ALL_D`, and that path works as of ADR-0010:
+D=512 used to return cosine 0.039 for every KV type because `nthreads` was `max(128, D)` and a
+512-thread work-group exceeds what the device grants this kernel at its register pressure. It is
+capped at 256 now, covered at both vec instantiations (`n_q` 1 and 2), and was never turbo-specific.
 
 Outside the covered set there is no abort: `ggml_sycl_flash_attn_ext_supported` is just
 `get_best_fattn_kernel != NONE`, so ggml schedules the whole flash-attention node on the **CPU backend**

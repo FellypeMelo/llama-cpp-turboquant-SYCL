@@ -1043,6 +1043,14 @@ int main() {
         };
         for (const auto & c : d512_cfgs) {
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 512);
+            // n_q=2 is the other vec instantiation, cols_per_block=2, and it must be covered here
+            // rather than assumed: VKQ and Q_reg are declared [ncols][...], so ncols=2 doubles the
+            // per-lane register footprint that caused the D=512 failure in the first place, and the
+            // nthreads cap was tuned against ncols=1 only. Reachable in production - the router
+            // sends quantized KV with Q->ne[1] <= 2 to the vec kernel (fattn.cpp), which is
+            // two-slot batched decode or a narrow speculative step. Above 2 it goes to TILE, so 2
+            // is exactly the value that exercises this template.
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 2, 256, 512);
         }
     }
 
