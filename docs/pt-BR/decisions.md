@@ -606,3 +606,73 @@ terceira causa.
 
 Achado por revisao adversarial olhando `git log` do upstream, fora do escopo dos arquivos do diff.
 Nenhuma das quatro lentes de codigo teria encontrado.
+
+---
+
+## ADR-0010 - head_dim 512 e as lacunas de teste do kernel VEC
+
+**Data:** 2026-07-29
+**Status:** Aceito (validado na Arc B580, golden 108/108 em JIT e AOT, e2e 11/11)
+
+### head_dim 512: tamanho de work-group, nao memoria
+
+O ADR-0009 registrou D=512 como quebrado com causa desconhecida: `f16 x f16` e `q8_0 x q8_0`
+mediam cosine 0,039 e 0,047. Resolvido.
+
+A causa e o **tamanho do work-group**. `nthreads` era `max(128, D)`, ou seja 512 ali, e o maximo
+que um device concede a um kernel **encolhe com a pressao de registrador daquele kernel** - em D=512
+o `Q_reg` somado ao `VKQ` ja fica perto do orcamento por lane. O lancamento nao produz saida, e lixo
+dessa magnitude e exatamente a assinatura disso. `nthreads` capado em 256 nos dois lados; o kernel ja
+lidava com `nthreads < D` pelos lacos com passo `i0 += nthreads`.
+
+**Duas hipoteses foram eliminadas por medicao antes da certa**, e ficam registradas para nao serem
+reverificadas: memoria local **nao** e o limite (16 KB em D=512 depois do combine fatiado, longe do
+teto) e a indexacao do buffer `KQ` **cabe** (`lsm_size3` cobre `nthreads`).
+
+**Nao e especifico do turbo.** `FATTN_VEC_CASES_ALL_D` sempre emitiu instancias em D=512 para f16,
+q4_0, q5_0 e q8_0, e o router manda decode comum para elas. Qualquer modelo de head_dim 512 neste
+backend produzia resultado errado.
+
+Somado ao descompasso host/device do ADR-0009, sao **dois defeitos no kernel VEC compartilhado** que
+atingiam o backend inteiro e so apareceram porque o turbo forcou a atencao para formas que nada
+testava.
+
+O upstream `c1063ac9d` contorna o mesmo caso fixando 128 threads, citando memoria local - remedio
+igual por motivo diferente. O proximo merge tera de reconciliar as duas leituras.
+
+### Lacunas de teste fechadas
+
+Uma auditoria encontrou recursos que o kernel implementa e que **nenhum teste jamais executou**.
+Tres foram cobertos; todos passaram, o que agora e medicao e nao suposicao:
+
+| recurso | casos antes | depois | alcancavel por |
+|---------|------------:|-------:|----------------|
+| `logit_softcap` | 0 | 9 | Gemma-2, Grok |
+| `sinks` | 0 | 6 | gpt-oss |
+| `ne[3] > 1` | 0 | 6 | **qualquer `-np N`** |
+| `head_dim 512` | 0 | 2 | modelos de head_dim 512 |
+
+O `logit_softcap` e parametro de template: metade de cada instancia compilada dependia dele e nunca
+tinha rodado. O `ne[3] > 1` e o mais alcancavel de todos - `kv_unified` e false por default
+(`common/common.h:571`), entao `n_stream = n_seq_max` e todo servidor com paralelismo usa essa forma.
+
+### Licao de metodo: o oraculo independente
+
+A primeira tentativa do `logit_softcap` falhou em **todos** os casos, inclusive `f16 x f16`, que nao
+tem turbo nenhum. Isso parecia provar defeito de backend - um caminho sem turbo falhando nao pode ser
+culpa do turbo. O raciocinio estava certo ate onde ia; o que ele nao considerou e que **um teste novo
+pode estar errado para todos os caminhos ao mesmo tempo**.
+
+A formula estava incompleta. O kernel faz `sum = logit_softcap * tanh(sum)` e isso parece conclusivo,
+mas o ggml divide a escala pelo softcap cem linhas antes e em outro arquivo
+(`ggml-cpu/ops.cpp`, `scale /= logit_softcap`). O score correto e
+`softcap*tanh(dot*scale/softcap)`.
+
+A assinatura estava nos numeros e passou despercebida: **cosine 0,989 com magnitudes varias vezes
+diferentes e erro de formula, nao corrupcao** - direcao preservada, escala deslocada.
+
+O que resolveu foi buscar um **oraculo independente** (a implementacao de CPU do ggml) em vez de
+arbitrar entre o teste e o kernel. Regra que passou a valer: quando um teste novo discorda de um
+kernel sem cobertura previa, confirmar a referencia contra uma implementacao independente **antes**
+de suspeitar do kernel. Quando ha cobertura previa que continua verde, ela serve de controle e a
+suspeita pode comecar pelo kernel - foi o caso dos quatro defeitos de D=256.
