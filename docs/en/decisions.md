@@ -178,3 +178,116 @@ combination: `(F16, TURBO3_0)` at D=64/128 (mirrors `q8_0-tq3.cpp`).
 - Adversarial read-only review (4 lenses): CONFIRMED_GREEN, zero refutation / zero critical issue.
 - PENDING: PPL rescue on Qwen2.5-7B Q4_K_M (absolute precision at long context) — model absent from
   disk.
+
+---
+
+# ADR-0006 through ADR-0011 — condensed
+
+The Portuguese file `docs/pt-BR/decisions.md` is the ADR record of file. These entries state the
+decision, the reason and the consequence; the measurements, the rejected alternatives and the
+diagnostic narrative are only there. Read that file before changing any of this code.
+
+## ADR-0006 — asymmetric prefill joins Option A, behind a column threshold
+
+**Status:** Accepted (validated on Arc B580).
+
+Turbo prefill runs by dequantizing the permuted turbo K/V views into contiguous f16 scratch and then
+running the proven f16 TILE kernel ("Option A"), rather than writing a native turbo TILE loader — the
+34/50/68-byte non-power-of-two strides produced garbage. That shim originally required a turbo K, so
+the asymmetric production config `q8_0-K x turbo3-V` missed it entirely and ran at ~12% of f16.
+Generalised: each non-f16 side gets a contiguous f16 shadow, an f16 side passes through. Result at
+pp512/2048/8192 went 630/299/95.7 -> 2540/1766/798 t/s, f16 parity at every length.
+
+The shim carries a **`Q->ne[1] >= 16` column threshold**. It dequantizes the entire cache, so it only
+pays for itself once enough Q columns amortise that pass. Batched decode under a unified KV cache
+(llama-server defaults to `n_parallel 4` + `kv_unified`) produces a small `Q->ne[1] > 2` and must stay
+on VEC. Without the threshold, every decode step would dequantize the whole cache.
+
+**Deferred in the same ADR:** the VEC `ncols2` GQA sharing that would close the decode-at-depth gap.
+Structural and addressable, gated on GRF pressure.
+
+## ADR-0007 — curated mixed-width turbo: turbo4-K with a cheaper turbo V
+
+**Status:** Accepted.
+
+Mixed-width turbo K/V used to abort in SYCL FA. The pairs `turbo4-K x {turbo3,turbo2}-V` are now
+curated and work, giving ~4.3-4.5x KV saving at turbo4-K quality — a point symmetric turbo cannot
+reach. Every other mixed width still aborts, on purpose.
+
+`TURBO4_0` is deliberately absent from the `type_K` axis of `EXTERN_DECL_FATTN_VEC_CASES`, so these
+rows instantiate implicitly and need no instance file. **Adding that extern declaration would suppress
+implicit instantiation for every TURBO4_0-K row and produce LNK2019** (see ADR-0004). The reverse
+widths (turbo3-K x turbo4-V) cost the same bytes but put the coarse quantizer on the side that
+dominates the error, so they stay out.
+
+## ADR-0008 — head_dim outside the covered set: the silent CPU fallback
+
+**Status:** Accepted; superseded on both coverage claims (ADR-0009 added D=256, ADR-0010 fixed D=512).
+
+`ggml_sycl_flash_attn_ext_supported` is just `get_best_fattn_kernel != NONE`. When it returns false
+ggml does **not** abort — it schedules the whole attention op on the CPU backend. The KV cache stays
+on the GPU in turbo format; what moves is the operation, so every step pays a GPU->CPU copy, CPU
+attention, and a copy back. Correct output, no log line, ~10x slower prefill.
+
+**None of the three gates can see this.** Golden compares values and the CPU computes correct values;
+e2e compares text and the text is coherent; perplexity compares quality and the quality is unchanged.
+This is the defining reason the fork warns at cache construction instead of relying on gates.
+
+## ADR-0009 — head_dim 256 in the VEC kernel: four bugs, none of them registers
+
+**Status:** Accepted (validated on Arc B580).
+
+D=256 took four separate fixes: LNK2019 on extern-declared combos; 128 KB of shared local memory in
+the final combine (twice the Xe2 per-work-group limit, so the kernel failed to JIT and took the whole
+program down); a host/device `nthreads` disagreement; and f16 TILE precision for turbo K. The macro
+comment that blamed register pressure was wrong on all four counts.
+
+Measured after: `q8_0 x turbo3` went 139 -> 1475 t/s at pp2048 on a head_dim-256 model, f16 parity.
+On a real server a 10k-token prompt went from 389 s to 9.5 s.
+
+Consequence in the dispatch: **turbo K at D>=256 is excluded from the Option A shim** — it drifts
+through the f16 TILE (rel-MSE 2.2e-2 for turbo3 x turbo3 against a 6e-3 bound) while the same pair on
+turbo VEC measures exactly 0.0. It is the f16 accumulation over 256 rotated terms that loses ground,
+not the data or the rotation.
+
+## ADR-0010 — head_dim 512 and the VEC kernel's test gaps
+
+**Status:** Accepted (validated on Arc B580, JIT and AOT).
+
+D=512 returned cosine ~0.04 for every KV type. The cause is **work-group size**: `nthreads` was
+`max(128, D)`, and the maximum a device grants a kernel shrinks with that kernel's register pressure.
+Capped at 256 on both host and device; the kernel already handled `nthreads < D`. This was never
+turbo-specific — it was a backend-wide defect in the shared VEC kernel, found only because turbo
+forced attention onto shapes nobody had tested.
+
+Two hypotheses were eliminated by measurement before the right one and are recorded so they are not
+re-checked: local memory is **not** the limit (16 KB at D=512 after the chunked combine), and the `KQ`
+buffer indexing **does** fit.
+
+Covered at both vec instantiations (`n_q` 1 and 2). The `n_q=2` case was added after review pointed
+out that `Q_reg`/`VKQ` are `[ncols][...]`, so ncols=2 doubles the register footprint that caused the
+original failure.
+
+## ADR-0011 — non-128-multiple head_dim with asymmetric KV: the second silent fallback
+
+**Status:** Accepted as a diagnostic. The behaviour is a known limitation, not a fixed bug.
+
+With the **recommended** config `-ctk q8_0 -ctv turbo3` on any model whose head_dim is not a multiple
+of 128 (head_dim 64 is the common case), the whole attention op runs on the CPU. The cache pads only
+the turbo side to a multiple of 128 (mandatory: `QK_TURBO = 128`, so a 64-wide turbo row cannot
+exist), and `llama-graph` pads Q only when **K** is turbo. So K stays 64, V becomes 128, and the
+dispatcher refuses `V->ne[0] != K->ne[0]`. Symmetric turbo on the same model works — both sides and Q
+are padded.
+
+Fixing it properly means padding both sides whenever either is turbo, which requires the padding
+region of a non-turbo K to be provably zeroed in the cache-write path. There is no head_dim-64 model
+on the validation machine, and a wrong padding here does not abort — it produces silently wrong
+numbers. So this ADR ships **diagnostics only**.
+
+The previous warning was wrong in both directions: it fired on head_dim 256 (which ADR-0009 made work
+at f16 parity, so it told users to abandon a working config) and stayed silent on head_dim 64 (this
+case). Replaced by a test on the **effective** post-padding dims, which is what the dispatcher sees.
+
+Also recorded: the `D=64` rows in `FATTN_VEC_CASES_TURBO_D` are unreachable, because no turbo tensor
+can have 64 columns and the cache always pads first. They are dead code, compiled into every AOT
+build. Left in place deliberately — removing them touches the dispatch table for compile-time gain.

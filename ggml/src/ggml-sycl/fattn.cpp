@@ -197,10 +197,14 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
     // Reachable from ordinary CLI flags, not just an internal invariant, so say what to do instead
-    // of only what went wrong. Examples that land here: -ctk turbo3 -ctv turbo2, or any
-    // -ctk q4_0/q4_1/q5_0/q5_1 paired with a turbo V. Note -ctv turbo2 additionally auto-enables
-    // adaptive mode 8 (llama-kv-cache.cpp), which leaves -ctk untouched on non-boundary layers, so
-    // an unsupported K survives into the layers that actually run this kernel.
+    // of only what went wrong. Examples that land here: -ctk turbo3 -ctv turbo2, or -ctk q4_0 with
+    // a turbo V. Note -ctv turbo2 additionally auto-enables adaptive mode 8 (llama-kv-cache.cpp),
+    // which leaves -ctk untouched on non-boundary layers, so an unsupported K survives into the
+    // layers that actually run this kernel.
+    // NOT reachable from here: q4_1/q5_0/q5_1 as K. ggml_sycl_get_best_fattn_kernel returns NONE
+    // for those under the curated #ifndef GGML_SYCL_FA_ALL_QUANTS path, so they never reach this
+    // dispatcher at all - ggml runs the whole attention op on the CPU instead, silently (ADR-0008).
+    // An abort is the loud failure mode; the quiet one is the dangerous one.
     GGML_ABORT("Not match KV type in vec: Q->ne[0]=%d K->type=%s V->type=%s\n"
                "  This KV type pair has no curated SYCL flash-attention instance.\n"
                "  Supported with a turbo V: K in {f16, q8_0, same-width turbo, turbo4}.\n"

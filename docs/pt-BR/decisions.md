@@ -677,3 +677,123 @@ arbitrar entre o teste e o kernel. Regra que passou a valer: quando um teste nov
 kernel sem cobertura previa, confirmar a referencia contra uma implementacao independente **antes**
 de suspeitar do kernel. Quando ha cobertura previa que continua verde, ela serve de controle e a
 suspeita pode comecar pelo kernel - foi o caso dos quatro defeitos de D=256.
+
+---
+
+## ADR-0011 - head_dim nao-multiplo de 128 com KV assimetrico: o segundo fallback silencioso
+
+**Data:** 2026-07-29
+**Status:** Aceito como diagnostico (golden 110/110 e e2e 11/11 na B580 apos a mudanca). O
+comportamento em si continua sendo uma limitacao conhecida, nao um bug corrigido.
+
+### O que acontece
+
+Com `-ctk q8_0 -ctv turbo3` - a config **recomendada** - em qualquer modelo cujo head_dim nao seja
+multiplo de 128 (head_dim 64 e o caso comum: Qwen2.5-0.5B/1.5B e parecidos), a atencao inteira sai
+da GPU e vai para o backend de CPU. Sem abort, sem linha de log, resultado correto, prefill ~10x
+mais lento.
+
+A cadeia, tres arquivos:
+
+1. `src/llama-kv-cache.cpp` padda para o proximo multiplo de 128 **apenas o lado que e turbo** - K se
+   `k_is_turbo`, V se `v_is_turbo`. Isso e obrigatorio: `QK_TURBO{2,3,4} = 128`, entao uma linha
+   turbo de 64 colunas nao existe.
+2. `src/llama-graph.cpp` padda o Q **gated em `k->type` ser turbo**. Com K = q8_0 o Q fica em 64.
+3. Resultado no no de flash-attention: K em 64, V em 128. `ggml_sycl_get_best_fattn_kernel`
+   (`ggml/src/ggml-sycl/fattn.cpp`) rejeita `V->ne[0] != K->ne[0]` e devolve NONE. Como
+   `ggml_sycl_flash_attn_ext_supported` e so `get_best_fattn_kernel != NONE`, o ggml agenda o no na
+   CPU - mesmo mecanismo do ADR-0008.
+
+Turbo simetrico no mesmo modelo funciona: os dois lados sao paddados para 128, o Q tambem (o gate do
+passo 2 acerta), e o kernel D=128 roda normal.
+
+### Por que so foi avisado, e nao corrigido
+
+O consertar de verdade e paddar os dois lados quando qualquer um for turbo. Isso exige que a regiao
+de padding de um K nao-turbo seja **provadamente zerada** no caminho de escrita do cache (senao o
+produto interno soma lixo) e que o Q seja paddado junto. Nao ha modelo head_dim 64 na maquina de
+validacao, e a regra do projeto e nao mudar numerica sem medir em silicio. Um padding errado aqui
+nao aborta: ele produz numeros silenciosamente errados, que e a pior classe de defeito possivel
+neste codigo.
+
+Entao a mudanca desta ADR e **so diagnostico**: o aviso em `llama_kv_cache` agora calcula os dois
+head_dims efetivos (aplicando o padding que ele mesmo vai aplicar logo abaixo) e avisa quando eles
+divergem, dizendo o que fazer - usar a mesma familia dos dois lados.
+
+### O aviso antigo estava errado nas duas pontas
+
+O aviso que existia disparava em `hd != 64 && hd != 128`:
+
+- **falso positivo** em head_dim 256, que o ADR-0009 passou a cobrir com paridade de f16 - ele
+  mandava o usuario abandonar o turbo numa config que funciona;
+- **falso negativo** em head_dim 64, exatamente o caso deste ADR - passava calado.
+
+Ou seja, o unico sinal existente para o problema do ADR-0008 errava nos dois sentidos. Trocado por
+um teste sobre os dims **efetivos** (pos-padding), que e o que o dispatcher enxerga.
+
+### O aviso tambem ficava mudo em modelos iSWA e hibridos
+
+Descoberto medindo, nao lendo. O aviso disparava sob `il == 0`, o que parece equivalente a "uma vez
+por cache" e nao e: o laco pula camadas em `has_kv(il)` e em `filter(il)`, entao um cache que nao
+possui a camada 0 nunca avaliava a condicao.
+
+Medido em `gemma-4-12b-it` (48 camadas, `-ctk turbo3 -ctv turbo3`): **nenhum aviso**, apesar de o
+modelo cair na CPU. O motivo aparece em `n_embd_head_k_all`, que o proprio laco calcula:
+
+```
+llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 256
+llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 512
+```
+
+O gemma-4 e iSWA e constroi **dois** caches, com head_dims diferentes: 256 (40 camadas, coberto) e
+512 (8 camadas, **nao** coberto pelo turbo - `FATTN_VEC_CASES_TURBO_D` emite 64/128/256). O cache de
+512 nao possui a camada 0, entao ficava calado, e essas 8 camadas rodavam atencao na CPU sem uma
+linha de log. Trocado por uma flag `logged_turbo_fallback` armada na primeira camada que o cache
+realmente processa.
+
+Isso amplia o ADR-0008: o fallback silencioso nao e so por modelo, e **por cache**. Um modelo pode
+ter parte das camadas na GPU e parte na CPU.
+
+### Tabela-verdade do aviso
+
+**Medida**, nao derivada, carregando cada modelo com `llama-cli -v`. Um aviso que dispara onde nao
+devia e tao ruim quanto um que nao dispara: o antigo mandava abandonar o turbo em head_dim 256, que
+funciona com paridade de f16.
+
+| modelo (real, no disco) | config | aviso |
+|---|---|---|
+| Qwen3-4B, hd 128 | `q8_0 x turbo3` | silencioso |
+| Qwen3.5-4B, hd 256 | `q8_0 x turbo3` | silencioso |
+| Qwen3.5-4B, hd 256 | `turbo3 x turbo3` | silencioso |
+| gemma-4-12b, iSWA hd 256 + 512 | `turbo3 x turbo3` | **(a)** efetivo 512 (so no cache de 512) |
+| GLM-4.7-Flash, MLA 576/512 | `q8_0 x turbo3` | **(a)** efetivo 576 |
+| GLM-4.7-Flash, MLA 576/512 | `turbo3 x turbo3` | **(a)** efetivo 576 |
+
+Nao medidos por falta de modelo head_dim 64 na maquina; derivados do codigo:
+
+| hd 64 ou 96, turbo **simetrico** (os dois lados paddados para 128) | silencioso |
+|---|---|
+| hd 64, `q8_0 x turbo3` | **(b)** K=64 V=128 |
+| hd 64, `turbo3 x f16` | **(b)** K=128 V=64 |
+
+Duas previsoes minhas foram corrigidas pela medicao, e ambas valem registro:
+
+1. **gemma-4 nao avisava nada.** Causa na secao acima (gate `il == 0` num modelo iSWA).
+2. **GLM simetrico reporta 576, nao os 640 que eu previa.** Porque o caminho **auto-assimetrico**
+   (`GQA >= 6`) entra antes e faz upgrade do K de turbo3 para q8_0 - GLM tem `n_head=20,
+   n_head_kv=1`, ou seja 20:1. Com K nao-turbo nao ha padding, entao o efetivo fica 576. Esta e
+   tambem a primeira observacao do auto-assimetrico disparando num modelo real: no Qwen3-4B (GQA
+   4:1) ele nunca engaja, entao ate aqui so havia confirmacao negativa.
+
+O caso MLA e o motivo de o ramo (b) ter guarda `!is_mla`. Ali `n_embd_head_k` (576) e
+`n_embd_head_v` (512) divergem por construcao e o dispatcher tem um `case 576` dedicado, entao a
+divergencia nao e a causa - a causa e o teto de 256 do turbo. Sem a guarda o aviso culparia o
+padding e mandaria "usar a mesma familia dos dois lados", conselho que nao resolve nada em MLA;
+medido com o binario pre-guarda, era exatamente isso que saia.
+
+### Nota: o caso D=64 turbo do `FATTN_VEC_CASES_TURBO_D` e inalcancavel
+
+O macro emite D=64, mas nenhum tensor turbo de 64 colunas pode existir (`blck_size` 128), e o cache
+sempre padda antes. As instancias D=64 turbo sao codigo morto - compiladas em todo build AOT e nunca
+executadas. Deixadas no lugar de proposito: remove-las mexe na tabela de dispatch por ganho de tempo
+de compilacao, e a regra vale aqui tambem. Registrado para quem for medir custo de AOT depois.

@@ -136,12 +136,12 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    // TURBO BEGIN — auto-asymmetric K upgrade (re-integrate onto upstream n_layer_all/n_layer_kv refactor)
+    // TURBO BEGIN - auto-asymmetric K upgrade (re-integrate onto upstream n_layer_all/n_layer_kv refactor)
     // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
     // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
     // Turbo K quantization error gets amplified by the GQA broadcast factor.
-    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
-    // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
+    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 -> turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
+    // Mistral:  8 KV heads / 32 Q heads = 4:1 -> turbo3 K works fine (+4.4% PPL)
     // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
     {
         const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
@@ -154,7 +154,7 @@ llama_kv_cache::llama_kv_cache(
             const bool disabled = (env && env[0] == '0');
 
             if (!disabled && gqa_ratio >= 6 && type_k == type_v) {
-                LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) — "
+                LLAMA_LOG_WARN("%s: auto-asymmetric: GQA ratio %u:1 (n_head=%u, n_head_kv=%u) - "
                                "upgrading K from %s to q8_0 to prevent quality degradation. "
                                "Disable with TURBO_AUTO_ASYMMETRIC=0\n",
                                __func__, gqa_ratio, n_head, n_head_kv, ggml_type_name(type_k));
@@ -227,6 +227,14 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+
+    // Fires the turbo CPU-fallback warning once per cache, on the first layer this cache actually
+    // owns. Gating on `il == 0` instead looks equivalent and is not: layer 0 is skipped by the
+    // `has_kv` and `filter` guards below, so on an iSWA model (two caches, one per attention type)
+    // or a hybrid with non-attention layers, the cache that does not own layer 0 stays silent no
+    // matter what it is configured with. Measured on gemma-4-12b (48 layers -> caches of 8 and 40):
+    // head_dim 512 with turbo3 on both sides produced no warning at all.
+    bool logged_turbo_fallback = false;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -310,19 +318,24 @@ llama_kv_cache::llama_kv_cache(
         //   2 = q8_0 K+V for last 8 layers
         //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
         //   6 = V-only: last 8 V=turbo4, rest V=turbo2 (K unchanged)
-        //   7 = Boundary V: first2+last2 V=q8_0, rest V=turbo2 (K unchanged) — mixed K=turbo/V=q8_0
+        //   7 = Boundary V: first2+last2 V=q8_0, rest V=turbo2 (K unchanged) - mixed K=turbo/V=q8_0
         //       (NOTE: the SYCL VEC kernel is unreliable for K=turbo + V=q8_0, so prefer mode 8)
         //   8 = Boundary symmetric q8_0 (SYCL default for turbo2): first2+last2 K=q8_0 AND V=q8_0,
         //       rest K/V=turbo2. Keeps every layer symmetric so only proven q8_0/q8_0 and
-        //       turbo2/turbo2 FA paths run — no mixed K=turbo/V=q8_0.
+        //       turbo2/turbo2 FA paths run - no mixed K=turbo/V=q8_0.
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
+            // Deliberately not `static`: the decision below reads type_v and hparams, which differ
+            // between the caches a single process builds (main vs draft model under speculative
+            // decoding, or two contexts with different -ctk/-ctv). A function-local static would
+            // freeze whatever the first cache ever constructed decided and silently apply it to
+            // every later one. Recomputing costs one getenv per layer.
+            const int adaptive_mode = [&]() {
                 const char * env = getenv("TURBO_LAYER_ADAPTIVE");
                 if (env) {
                     int mode = atoi(env);
-                    if (mode > 0) {
+                    if (mode > 0 && il == 0) {
                         LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
                     }
                     return mode;
@@ -332,7 +345,9 @@ llama_kv_cache::llama_kv_cache(
                 // handles unreliably (nthreads_KQ=1 turbo K + nthreads_V=warp q8_0 V); mode 8 keeps
                 // the boundaries symmetric q8_0 so only proven FA paths run.
                 if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary symmetric q8_0 auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+                    if (il == 0) {
+                        LLAMA_LOG_INFO("llama_kv_cache: Boundary symmetric q8_0 auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+                    }
                     return 8;
                 }
                 return 0;
@@ -389,21 +404,57 @@ llama_kv_cache::llama_kv_cache(
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
         const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
-        // The SYCL turbo flash-attention kernels only exist for head_dim 64 and 128
-        // (FATTN_VEC_CASES_TURBO_D). Outside that, ggml_sycl_flash_attn_ext_supported returns false
-        // and ggml quietly runs attention on the CPU: correct results, roughly 10x slower prefill,
-        // with nothing in the log to say why. Measured on a head_dim-256 model (Arc B580, pp2048):
-        // q8_0 x turbo3 139 t/s against 1401 for q8_0 x q8_0. Say so once, at load.
+        // When ggml_sycl_flash_attn_ext_supported returns false, ggml does not abort: it schedules
+        // the whole attention op on the CPU backend. Correct results, roughly 10x slower prefill,
+        // and not one line in the log to say why. None of the three gates can see it - golden
+        // compares values, e2e compares text, perplexity compares quality, and the CPU is right on
+        // all three. So the only defence is to say it here, at load. See ADR-0008/0011.
+        //
+        // Two distinct ways to land there, both checked below:
+        //   (a) the padded head_dim has no turbo instance (FATTN_VEC_CASES_TURBO_D emits 128 and
+        //       256; 64 is emitted but unreachable because the cache pads every turbo row up to a
+        //       multiple of QK_TURBO=128 before the kernel ever sees it),
+        //   (b) K and V end up with different head_dims because only one side is turbo and only
+        //       turbo sides get padded, which ggml_sycl_get_best_fattn_kernel rejects outright
+        //       (fattn.cpp, "V->ne[0] != K->ne[0]").
         {
             const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 ||
                                      layer_type_v == GGML_TYPE_TURBO4_0 ||
                                      layer_type_v == GGML_TYPE_TURBO2_0);
-            const uint32_t hd = hparams.n_embd_head_k(il);
-            if (il == 0 && (k_is_turbo || v_is_turbo) && hd != 64 && hd != 128) {
-                LLAMA_LOG_WARN("%s: turbo KV requested but head_dim is %u; the SYCL turbo kernels "
-                               "cover only 64 and 128, so flash-attention will fall back to the CPU "
-                               "and prefill will be far slower. Prefer -ctk q8_0 -ctv q8_0 on this "
-                               "model.\n", __func__, hd);
+            const uint32_t hd_k = hparams.n_embd_head_k(il);
+            const uint32_t hd_v = hparams.n_embd_head_v(il);
+            const auto pad128 = [](uint32_t d) { return ((d + 127) / 128) * 128; };
+            // What the flash-attention node will actually receive, after the padding applied below.
+            const uint32_t eff_k = k_is_turbo ? pad128(hd_k) : hd_k;
+            const uint32_t eff_v = (v_is_turbo && !is_mla) ? pad128(hd_v) : hd_v;
+
+            if (!logged_turbo_fallback && (k_is_turbo || v_is_turbo)) {
+                logged_turbo_fallback = true;
+                // MLA is excluded from the mismatch branch on purpose: there K and V legitimately
+                // differ (n_embd_head_k 576 against n_embd_head_v 512) and the dispatcher has a
+                // dedicated `case 576` for it, so a mismatch there is normal and the padding is not
+                // the reason turbo fails. Such a model falls through to the coverage branch below,
+                // which reports the real cause - an effective head_dim far above the 256 ceiling.
+                if (!is_mla && eff_k != eff_v) {
+                    // (b) Reachable from the recommended production config: -ctk q8_0 -ctv turbo3
+                    // on any model whose head_dim is not a multiple of 128 (head_dim 64 is common -
+                    // Qwen2.5-0.5B/1.5B and friends). V is padded to 128, K is left at 64, and the
+                    // pair is refused. Symmetric turbo pads both sides and works.
+                    LLAMA_LOG_WARN("%s: turbo KV with head_dim %u leaves K at %u and V at %u "
+                                   "(only turbo sides are padded to a multiple of 128). The SYCL "
+                                   "flash-attention dispatcher requires K and V to share a head_dim, "
+                                   "so attention will run on the CPU for every layer: correct output, "
+                                   "far slower prefill. Use the same family on both sides on this "
+                                   "model (-ctk turboN -ctv turboN, or -ctk q8_0 -ctv q8_0).\n",
+                                   __func__, hd_k, eff_k, eff_v);
+                } else if (eff_k != 128 && eff_k != 256) {
+                    // (a) Measured on a head_dim-256 model before ADR-0009 (Arc B580, pp2048):
+                    // q8_0 x turbo3 139 t/s against 1401 for q8_0 x q8_0.
+                    LLAMA_LOG_WARN("%s: turbo KV requested but the effective head_dim is %u; the "
+                                   "SYCL turbo kernels cover 128 and 256, so attention will run on "
+                                   "the CPU: correct output, far slower prefill. Prefer "
+                                   "-ctk q8_0 -ctv q8_0 on this model.\n", __func__, eff_k);
+                }
             }
         }
         if (k_is_turbo && n_embd_head_k % 128 != 0) {
@@ -510,8 +561,8 @@ llama_kv_cache::llama_kv_cache(
             #include "turbo-rotation-data.h"
             // ggml is column-major; C arrays are row-major. Storing a row-major matrix
             // into ggml implicitly transposes it. ggml_mul_mat(A, x) computes A^T @ x.
-            // To get R @ q: store R^T → ggml sees (R^T)^T_col = R → mul_mat gives R @ q. Wait no —
-            // store R so ggml col-major reads it as R^T, then mul_mat gives (R^T)^T = R. ✓
+            // To get R @ q: store R^T -> ggml sees (R^T)^T_col = R -> mul_mat gives R @ q. Wait no -
+            // store R so ggml col-major reads it as R^T, then mul_mat gives (R^T)^T = R. ok
             // Store R for Q forward rotation, R^T for V inverse rotation
             // ggml_mul_mat(A,x) computes A@x for row-major stored A (verified by test)
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
@@ -557,11 +608,11 @@ llama_kv_cache::llama_kv_cache(
         // phi-4, on q8/turbo4 KV) showed the optimal rotation policy is highly
         // model-and-quant specific:
         //
-        //   • gemma-4 31B Q8 q8/turbo4: V-only rotation gives -43% PPL (huge win).
-        //   • gemma-4 26B-A4B Q8 q8/turbo4: V-only gives -3.9%.
-        //   • gemma-4 E2B Q4_K_L q8/turbo4: V-only HURTS by +6.7%.
-        //   • phi-4 Q8 q8/turbo4: V-side rotation crashes (graph hash overflow).
-        //   • Qwen2.5/3.5/Mistral: rotation effect is within standard error.
+        //   - gemma-4 31B Q8 q8/turbo4: V-only rotation gives -43% PPL (huge win).
+        //   - gemma-4 26B-A4B Q8 q8/turbo4: V-only gives -3.9%.
+        //   - gemma-4 E2B Q4_K_L q8/turbo4: V-only HURTS by +6.7%.
+        //   - phi-4 Q8 q8/turbo4: V-side rotation crashes (graph hash overflow).
+        //   - Qwen2.5/3.5/Mistral: rotation effect is within standard error.
         //
         // No single default is correct everywhere, including within the same
         // architecture family (gemma-4 above shows three distinct optima across
@@ -596,7 +647,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        // (model-correctness requirement — independent of the tuning default above)
+        // (model-correctness requirement - independent of the tuning default above)
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
@@ -1584,7 +1635,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
 
-    // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
+    // [TAG_V_CACHE_VARIABLE] - for turbo-padded V, cache may be larger
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     // Use padded head_dim for turbo types
@@ -1627,7 +1678,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // Turbo zero-padding: pad each head to next multiple of 128 before merging dims.
     // k_cur shape here is (n_embd_head, n_head, n_tokens).
-    // ggml_pad pads ne[0] with zeros — exactly what we need per-head.
+    // ggml_pad pads ne[0] with zeros - exactly what we need per-head.
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
     const bool k_needs_pad = k_is_turbo && (n_embd_head % 128 != 0);
     if (k_needs_pad) {
@@ -1773,7 +1824,7 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
         // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
         // for K, mirroring V's choice. Master defaults to the largest power-of-2
         // that divides head_dim, but the upstream comment hypothesizes smaller
-        // tiles preserve more local structure → less PPL hit on sensitive models
+        // tiles preserve more local structure -> less PPL hit on sensitive models
         // (gemma-4 26B-A4B reportedly regresses with the largest tile).
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
         const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
@@ -2482,7 +2533,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         auto * k = layer.k_stream[cr.strm];
 
-        // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
+        // Use actual tensor width (may be padded for turbo types: e.g. 576->640)
         const uint32_t n_embd_k_gqa = (uint32_t) k->ne[0];
 
         // Write key type

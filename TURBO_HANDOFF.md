@@ -1,78 +1,180 @@
 # TurboQuant SYCL — Session Handoff
 
-_Last updated: 2026-07-06. Read this first when resuming in a new session._
+_Last updated: 2026-07-29. Read this first when resuming in a new session._
+
+_This file records **state and traps**, not a plan. It deliberately pins no commit SHA — run
+`git log --oneline -15` on `feature/turboquant-kv-cache` for that. The previous version of this file
+pinned one, went 23 days and ~230 commits stale, and ended up recommending the worst measured
+configuration in the project._
 
 ## North star
-Full TurboQuant KV-cache quantization working **flawlessly on the SYCL backend**, max performance on Intel Arc hardware. **SYCL is the only backend that matters.** Target HW: Intel Arc B580 (Battlemage / Xe2, arch `bmg_g21`), 12 GB. Reference model: Qwen3-4B Q4_K_M (head_dim=128, GQA 4:1, 36 layers, pure attention).
+TurboQuant KV-cache quantization working flawlessly on the **SYCL backend**, max performance on Intel
+Arc. **SYCL is the only backend that matters** — CUDA/Metal/Vulkan turbo files exist as reference and
+are not validated here. Target HW: Intel Arc B580 (Battlemage / Xe2, `bmg_g21`), 12 GB. Reference
+model: Qwen3-4B Q4_K_M (head_dim 128, GQA 4:1, 36 layers, pure attention).
 
-## Immediate goal for the next session
-**Run turbo KV cache on the Open-ChatBot project** (`G:\Programas\Open-ChatBot`) — a chatbot frontend/backend that launches `llama-server`.
+---
 
-### Plan
-1. **Stop** any running Open-ChatBot llama-server (avoid two GPU procs clashing on the B580).
-2. **Smoke-test turbo3 first** on that project's exact model via `llama-cli` with a short prompt — the model is a **hybrid arch (untested with turbo)**, so verify no abort + coherent output before wiring it into the app.
-   - Model: `G:\Programas\Open-ChatBot\models\Qwen3-4B-Hivemind-Inst-Hrtic-Ablit-Uncensored-Q4_K_M-imat.gguf`
-   - Run: `llama-cli -m <model> -ngl 99 -fa on -ctk turbo3 -ctv turbo3 -c 8192 -p "Hello, tell me a short story." -n 64 -st`
-   - Watch for `Not match KV type in vec` / gibberish. Coherent = pass.
-3. If pass → set Open-ChatBot config (below), add `SYCL_CACHE_PERSISTENT=1`, restart.
-4. If abort/garbage → diagnose the hybrid-arch turbo path in `src/llama-kv-cache.cpp` (adaptive-mode/boundary logic assumes standard attention layers), OR fall back to `q4_0`.
-5. Optional: bump `-c` to 32768+ so turbo's RAM savings actually matter.
+## The one thing to get right
 
-### Open-ChatBot config change
-In the backend's config `additional_args`, swap:
 ```
---cache-type-k q4_0 --cache-type-v q4_0 --flash-attn auto
+llama-server -m model.gguf -ngl 99 --flash-attn on --cache-type-k q8_0 --cache-type-v turbo3 -c 32768
 ```
-→
+
+**Protect K at 8-bit, compress V.** Measured on wikitext-2 (Qwen3-4B Q4_K_M, `-c 512 --chunks 32`,
+2026-07-28), perplexity vs f16 9.054:
+
+| config | PPL | delta |
+|---|---|---|
+| `q8_0 x turbo3` | 9.091 | **+0.4%** |
+| `f16 x turbo3` | 9.104 | +0.6% |
+| `turbo4 x turbo4` | 9.511 | +5.1% |
+| `turbo3 x q8_0` | 11.781 | +30.1% |
+| `turbo3 x turbo3` | 11.920 | **+31.7%** |
+| `turbo2 x turbo2` | 12.821 | +41.6% |
+
+**Never recommend symmetric turbo2/turbo3.** Turbo on **V** costs ~0.4%; turbo on **K** costs ~30%.
+
+This is the single most important correction in the project's history, and it arrived late: for three
+weeks every document here recommended symmetric turbo3, on the strength of the e2e gate showing
+coherent text. **Coherence is not quality.** A model 32% worse in perplexity still writes fluent
+sentences. The golden test is structurally blind to it too — it quantizes K and V identically, so the
+quantization error cancels. Only perplexity sees it.
+
+---
+
+## Current state
+
+### Works, validated on the B580
+- **turbo2 / turbo3 / turbo4** KV on SYCL. Golden 110/110 under both JIT and AOT; e2e 11/11 configs
+  coherent.
+- **Prefill at f16 parity**, symmetric *and* asymmetric. `q8_0-K x turbo3-V` does 2540/1766/798 t/s at
+  pp512/2048/8192 against f16's 2582/1769/798.
+- **Asymmetric KV** `{q8_0,f16} x {turbo2,turbo3,turbo4}` — all six dispatch and are gated.
+- **Curated mixed-width** `turbo4-K x {turbo3,turbo2}-V` (ADR-0007). Every other mixed width aborts.
+- **head_dim 64, 128, 256** for turbo; non-turbo types also reach 512.
+- **KV memory @64k vs fp16:** turbo2 5.6x, turbo3 5.1x, turbo4 3.8x (q8_0 only 1.9x).
+
+### Known limitations — read before diagnosing anything
+1. **head_dim 64 + asymmetric KV silently runs attention on the CPU** (ADR-0011). `-ctk q8_0 -ctv
+   turbo3` on a head_dim-64 model pads V to 128 and leaves K at 64; the dispatcher refuses the pair.
+   Correct output, ~10x slower. A warning now fires at cache construction. Symmetric turbo works on
+   those models.
+2. **Any uncovered head_dim does the same thing** (ADR-0008). `ggml_sycl_flash_attn_ext_supported` is
+   just `get_best_fattn_kernel != NONE`, and ggml responds to false by scheduling the op on the CPU
+   backend — not by aborting. **No gate can detect this**: golden compares values (CPU values are
+   correct), e2e compares text (text is coherent), PPL compares quality (quality is unchanged).
+   Before blaming turbo for slowness on a new model, check `n_embd_head_k` first.
+   **It is per-cache, not per-model.** An iSWA model builds one cache per attention type and they can
+   have different head_dims, so part of the layers can run on the GPU and part on the CPU. Measured
+   on `gemma-4-12b` (48 layers -> caches of 40 at head_dim 256 and 8 at head_dim 512): with turbo the
+   8 head_dim-512 layers fall to the CPU. Verified head_dims on the models present here:
+   Qwen3-4B 128, Qwen3.5-4B/9B and Qwen3.6-28B 256, gemma-4-12b 256+512, GLM-4.7-Flash 576/512 (MLA).
+   Only the first two groups run turbo on the GPU.
+3. **Decode collapses at deep context** (~3.4x slower than f16 @32k). `q8_0` collapses identically, so
+   it is not a turbo defect — but it is *not* "inherent to quantized KV" either. f16 decode routes to
+   the GQA-batched TILE, which dequantizes each K/V row once for the whole GQA group; every quantized
+   type is forced onto VEC with `ncols2` hardcoded to 1, so VEC re-reads each row once per query head
+   (~4x at GQA 4:1). Structural and addressable. Deferred, gated on GRF pressure.
+4. **Context shift is disabled for turbo** (`get_can_shift()` returns false) — turbo K-shift is
+   unimplemented and there is no SYCL turbo<->f32 cast. It falls back instead of crashing.
+5. **`--cache-reuse` does not work on M-RoPE / I-M-RoPE models** — `can_shift` returns false for
+   `n_pos_per_embd() > 1`. Unrelated to turbo.
+6. **The `D=64` turbo rows in `FATTN_VEC_CASES_TURBO_D` are dead code.** No turbo tensor can have 64
+   columns (`blck_size` 128) and the cache always pads first. Compiled into every AOT build, never
+   executed. Left in place on purpose.
+
+### Adaptive modes
+`TURBO_LAYER_ADAPTIVE` in `src/llama-kv-cache.cpp`. **Mode 8 auto-enables when `-ctv turbo2`** and
+overrides `--cache-type-v` to turbo2 on non-boundary layers. Modes 5/6/7 abort in SYCL FA. Modes
+5/6/7 have never been spot-checked with `-ctk turbo4`.
+
+---
+
+## Gates — how to run them
+
+| gate | what it proves | command |
+|---|---|---|
+| **golden numeric** | CPU-golden vs SYCL kernel parity | `build-perf\bin\test-sycl-turbo.exe` (or `ctest --test-dir build -R test-sycl-turbo`) |
+| **e2e coherence** | real generation is coherent | `TURBO_E2E_MODEL=/path/Qwen3-4B-Q4_K_M.gguf bash tests/test-e2e-turbo-kv.sh` |
+| **quality + speed** | perplexity within 5% of q8_0 | `LLAMA=build-perf/bin bash scripts/turbo-quality-gate.sh` |
+| **static lockstep** | shim allowlist == curated rows == test predicate | `python scripts/check-fattn-lockstep.py` |
+
+All three GPU gates need the oneAPI environment sourced first, and the e2e/quality ones exit **77**
+(SKIP) when the model is absent — a 77 is not a pass.
+
+**What each gate cannot see:** golden is blind to asymmetric quality (it quantizes both sides the
+same); e2e is blind to quality entirely; all three are blind to the silent CPU fallback. When
+something is slow but correct, no gate will tell you — check the head_dim.
+
+---
+
+## Build
+
+oneAPI at `C:\Program Files (x86)\Intel\oneAPI` (compiler `2026.0`), VS 2022. Two flavors:
+
+- **build-sync** — JIT, `ggml-sycl.dll` ~61 MB. Fast to build, slow first launch. Use for iteration.
+- **build-perf** — AOT for `bmg_g21`, DLL ~270 MB. Slow to build, fast launch. **Use for any real
+  perf or PPL number.**
+
 ```
---cache-type-k turbo3 --cache-type-v turbo3 --flash-attn on
+cmake -B build-perf -G Ninja -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx \
+      -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL_DEVICE_ARCH=bmg-g21
+cmake --build build-perf --config Release -j 8 --target llama-cli llama-server llama-bench test-sycl-turbo
 ```
-- **Accepted type strings:** `turbo2`, `turbo3`, `turbo4` (NOT `turbo2_0`). turbo4 = 4-bit safest, **turbo3 = 3-bit best balance (~5.1× less KV RAM)**, turbo2 = 2-bit max savings/marginal quality.
-- **3 requirements:** (1) use the turbo `llama-server.exe` (copy `build\bin\llama-server.exe` → `Open-ChatBot\llama_bin\`; turbo types only parse on this build); (2) flash-attn **ON** (turbo requires FA); (3) oneAPI runtime present (their launcher already sources setvars → fine).
-- **Slow-start 503 fix:** SYCL JIT-compiles all kernels on first run → warmup exceeds the wrapper's 30-attempt `/health` window and *looks* like a failure, but the server does come up. Set `SYCL_CACHE_PERSISTENT=1` in the launcher env → kernels cache to disk, later starts are fast.
 
-### ⚠️ Hybrid-model caveat
-Open-ChatBot's model logs **`fused Gated Delta Net`** → it's a Qwen3-Next-style **hybrid** (attention layers + linear/DeltaNet layers), not the pure-attention Qwen3-4B turbo was validated on. Turbo on hybrid arch is **untested**. Test before trusting; fallback `q4_0`.
+**Toolchain gotchas under an agent shell:** add `C:\Program Files (x86)\Microsoft Visual Studio\Installer`
+to PATH (for `vswhere.exe`); `set "NoDefaultCurrentDirectoryInExePath="`; `icx` defaults to
+`-fno-exceptions` so add `/EHsc` for standalone compiles; run `.bat` via the **PowerShell tool**
+(`cmd /c ...`) because the Bash tool's `cmd //c` loses the system PATH.
 
-## Current state of the turbo work
+**Before relinking, kill every `llama-cli` / `llama-server` / `llama-bench` / `test-sycl-*`** — they
+hold `ggml-base.dll` and `ggml-sycl.dll` and the link fails with `LNK1104`. **Never run two GPU
+processes concurrently** on the single B580.
 
-### What works (validated on standard Qwen3-4B, B580)
-- Turbo KV cache **turbo2 / turbo3 / turbo4** on SYCL: golden test green (cosine 0.99999), coherent generation ("Tokyo"), flash-attention enabled.
-- **KV RAM savings vs f16 @64k:** turbo2 5.6×, turbo3 5.1×, turbo4 3.8× (q8_0 only 1.9×).
-- **Prefill at f16 parity** (Option A: dequant turbo→f16 + f16 TILE kernel; turbo3 pp512 1244 vs f16 1267).
-- **Decode at d0** ≈ f16 (turbo3 70 vs 75 t/s). Decode **collapses at deep context** — but this is inherent to *all* quantized KV (q8_0 collapses identically); not a turbo defect and not fixable without a fundamentally different decode kernel.
-- Context-shift with turbo: gracefully disabled (turbo K-shift not implemented; `get_can_shift()` returns false for turbo → no crash).
+Set `SYCL_CACHE_PERSISTENT=1` once so the JIT caches kernels to disk; otherwise first launch looks
+hung and can trip a wrapper's `/health` timeout.
 
-### Git / build / CI
-- Branch `feature/turboquant-kv-cache`, **HEAD `9300aca34`**, pushed to `origin` (github.com/FellypeMelo/llama-cpp-turboquant-SYCL — the user's fork; `upstream` = ggml-org, do NOT push there).
-- 7 turbo code commits + 1 CI commit pushed.
-- **Final Release build done + verified:** `build\bin\{llama-cli,llama-server,llama-bench,llama-quantize,test-sycl-turbo}.exe` (version `9098 (76fe21c3f)`, runs OK).
-- **CI/CD deployed:** `.github/workflows/tqp-sycl.yml`. Auto-builds on push to the branch + on manual dispatch (downloadable artifacts under the run); push a `tqp-sycl-v*` tag → publishes a GitHub Release (self-contained Windows SYCL zip with bundled oneAPI DLLs). First run `28824261096` — **PASSED GREEN** (windows-sycl 29m7s, linux-sycl 17m40s). Downloadable build artifacts (`turboquant-plus-sycl-windows-x64` zip + linux tar) attached to that run. Workflow validated end-to-end.
+---
 
-### XMX prefill kernel — PARKED
-Scoped a joint_matrix (XMX) FA prefill kernel. **Stage 0 PoC passed** (one fp16→f32 DPAS tile on B580, err 1e-10, JIT, SG16 — joint_matrix works). But **parked by user decision**: prefill is already at f16 parity so the payoff is marginal (~1.6% at pp512; win only maybe at pp8192). Full plan + DPAS combos + toolchain fixes are in memory `xmx-fa-prefill.md`. Worktree `G:\Programas\llama-cpp-turbo-xmx` (branch `feature/xmx-fa-prefill`, unbuilt) banked for later.
+## Open work, in the order it is worth doing
 
-## Build / run environment (Windows, oneAPI)
-- oneAPI at `C:\Program Files (x86)\Intel\oneAPI`, compiler `2026.0`. VS 2022.
-- **Standalone icx / setvars fixes** (needed under the agent shell): (1) add `C:\Program Files (x86)\Microsoft Visual Studio\Installer` to PATH (vswhere); (2) `set "NoDefaultCurrentDirectoryInExePath="` (so cmd resolves component `vars.bat`); (3) `/EHsc` (icx defaults to `-fno-exceptions`). Run `.bat` via the **PowerShell tool** `cmd /c ...` — Bash `cmd //c` loses system PATH → vswhere fails.
-- **Configure:** `cmake -B build -G Ninja -DGGML_SYCL=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release` (see `build_sycl.bat`).
-- **Build targets:** `cmake --build build --config Release -j 8 --target llama-cli llama-server llama-bench llama-quantize test-sycl-turbo`.
-- **Kill** llama-cli/llama-server/llama-bench/test procs before relinking (they hold the ggml-sycl DLL).
-- **Cannot run two GPU benches/servers concurrently** (they corrupt each other's measurements / clash on the device).
-- Scratchpad bats + outputs from this work: session scratchpad (build_poc.bat, final_build.bat, etc.).
+1. **Upstream merge — 231 commits behind, 54 conflicting files. NOT started, and not obviously worth
+   starting.** The fork carries intentional one-line divergences (`GGML_SYCL_FA_ALL_QUANTS` stays OFF,
+   the curated `#else` FA path) that a merge can revert silently. What breaks is the *link* of
+   instances that do not exist, so it surfaces at build time, not in any test. Merge only with time to
+   fix the fallout. Use `merge`, never `rebase` (ADR-0001).
+2. **VEC `ncols2` GQA sharing** — the real fix for decode-at-depth. Biggest remaining perf win.
+3. **head_dim 64 asymmetric padding** (ADR-0011) — needs a head_dim-64 model on the validation
+   machine. Do not attempt without one: a wrong padding produces silently wrong numbers, not an abort.
+4. **`nsm = max_compute_units/16`** — B580 reports 160 CUs so `nsm` lands at 10, but BMG G21 has 20
+   Xe-cores. Needs instrumentation and arch gating.
+5. **Adaptive modes 5/6/7 with `-ctk turbo4`** — never spot-checked.
+6. **Shared header for the FA allowlist** so the dispatch table, the prefill shim and the test
+   predicate cannot drift. `scripts/check-fattn-lockstep.py` enforces this externally today.
+7. **AOT kernel/DLL cost** — record it, and reconsider the dead D=64 turbo instances.
+8. **XMX (`joint_matrix`) prefill — PARKED by decision.** Stage 0 PoC passed on the B580 (one fp16->f32
+   DPAS tile, err 1e-10, SG16). Parked because prefill is already at f16 parity, so the payoff is
+   marginal. Plan is in memory `xmx-fa-prefill.md`; worktree `G:\Programas\llama-cpp-turbo-xmx`
+   (branch `feature/xmx-fa-prefill`, unbuilt).
 
-## Key files
-- Turbo KV cache logic (adaptive modes, shift guard, cpy): `src/llama-kv-cache.cpp`
-- SYCL flash-attention: `ggml/src/ggml-sycl/fattn.cpp` (dispatch + turbo prefill), `fattn-vec.hpp` (decode VEC), `fattn-common.hpp` (vec_dot), `fattn-tile.hpp` (f16 TILE)
-- Turbo primitives: `ggml/src/ggml-sycl/turbo-quants.hpp`, `turbo-wht.cpp`, `set_rows.cpp`
-- Type defs / names: `ggml/include/ggml.h`, `ggml/src/ggml-common.h`, `ggml/src/ggml.c` (type_name `turbo2`/`turbo3`/`turbo4`, line ~748); CLI parse `common/arg.cpp:384`
-- Golden/stress tests: `tests/test-sycl-turbo.cpp`
-- CI: `.github/workflows/tqp-sycl.yml`
-
-## Memory files (auto-load via MEMORY.md)
-`turbo-sycl-perf` · `turbo-sycl-parity-project` · `turbo-sycl-diagnosis` · `xmx-fa-prefill` · `open-chatbot-turbo-usage`
+---
 
 ## Working constraints
-- **No commit/push without explicit approval** (AGENTS.md). User has approved past turbo commits + the CI push.
-- Caveman response style active (terse; code/commits written normally).
-- Ultracode on (use Workflow for substantive multi-step tasks; adversarially verify).
+
+- **Never** `git push`, `gh pr create`, `gh pr comment` or `gh issue create` on the user's behalf, and
+  never author a PR description or reviewer reply. Prepare the branch and hand over the command.
+  Non-overridable (AGENTS.md).
+- **No commit or push without explicit per-action human approval.** When asked to commit, use
+  `Assisted-by: <assistant name>`, never `Co-authored-by:`.
+- **ASCII only** in code and commit messages.
+- **Test-first on real silicon.** No turbo change is done until the golden gate plus the e2e gate pass
+  on the B580. "Looks coherent" is not evidence — see the perplexity story above.
+- Validate turbo numerics against a **CPU golden in the rotated domain** before and after any FA or
+  WHT change. A finiteness smoke test is not a parity test.
+
+## Where things are
+
+`CLAUDE.md` — architecture and current state, authoritative. `AGENTS.md` — rules, non-negotiable.
+`docs/pt-BR/decisions.md` — ADR-0001..0011, the record of file. `docs/en/decisions.md` — ADR-0001..0005
+in full, 0006..0011 condensed. `GEMINI.md` — early design playbook, **stale, not authoritative**.

@@ -116,9 +116,12 @@ decode; asymmetric precise-K/turbo-V decode -> curated `FATTN_VEC_CASES_TURBO_D`
 Option A (`ggml_sycl_flash_attn_ext_turbo_prefill`) runs *before* that router and requires a **turbo V** with
 K in {f16, q8_0, same-width turbo}; each non-f16 side gets a contiguous f16 shadow, an f16 side passes
 through. Column threshold `Q->ne1 >= 16`, uniform - the shim dequantizes the whole cache, so batched decode
-under a unified KV cache (server default `n_parallel 4` + `kv_unified`) must stay on VEC. Excluded on purpose:
-reverse pairs (turbo K + f16/q8_0 V) and **mixed-width turbo** (letting the latter in makes prefill succeed
-and moves the `GGML_ABORT` to the first decode token). See ADR-0006.
+under a unified KV cache (server default `n_parallel 4` + `kv_unified`) must stay on VEC. Excluded on purpose: reverse pairs
+(turbo K + f16/q8_0 V); **uncurated mixed-width turbo** - the curated `turbo4-K x {turbo3,turbo2}-V` pairs
+*are* admitted (ADR-0007), everything else is not, because letting it in makes prefill succeed and moves the
+`GGML_ABORT` to the first decode token; and **turbo K at D>=256**, which drifts through the f16 TILE
+(rel-MSE 2.2e-2 for turbo3 x turbo3 against a 6e-3 bound, while the same pair on turbo VEC measures 0.0).
+See ADR-0006/0007/0009.
 
 **Split-KV / flash-decoding is already active** for decode: `launch_fattn` (`fattn-common.hpp`) computes
 `parallel_blocks` at runtime and runs `flash_attn_combine_results` when > 1, so deep-context decode is split
@@ -215,6 +218,17 @@ GPU->CPU copy, CPU attention, and a copy back. Correct output, no log line, ~10x
 **None of the three gates can see this** - golden compares values (the CPU computes correct values), e2e
 compares text (text is coherent), PPL compares quality (quality is unchanged). A warning fires at cache
 construction, and before blaming turbo for slowness on a new model, check `n_embd_head_k` first.
+
+The fallback is **per KV cache, not per model**: an iSWA model builds one cache per attention type and
+they can carry different head_dims, so some layers run on the GPU and some on the CPU. Measured on
+gemma-4-12b (48 layers -> a 40-layer cache at head_dim 256 and an 8-layer cache at 512): with turbo the
+eight 512 layers go to the CPU. The warning is armed on the first layer each cache actually owns, not on
+`il == 0` - layer 0 is skipped by the `has_kv`/`filter` guards, so a per-`il == 0` gate stays silent on
+exactly the caches that need it (ADR-0011). Two further interactions to keep in mind: `-ctk turboN` can
+be silently upgraded to `q8_0` by the auto-asymmetric path when GQA >= 6 (confirmed on GLM-4.7-Flash,
+20:1), which changes the effective head_dim because a non-turbo side is never padded; and MLA models
+legitimately carry `n_embd_head_k != n_embd_head_v`, so a K/V mismatch there is normal and not the
+reason turbo fails.
 
 D=256 took four separate fixes (LNK2019 on extern-declared combos, 128 KB of shared memory in the
 combine, a host/device `nthreads` disagreement, and f16 TILE precision for turbo K). The macro comment
