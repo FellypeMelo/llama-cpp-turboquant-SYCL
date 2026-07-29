@@ -395,7 +395,13 @@ static bool run_wht_roundtrip_test(ggml_backend_t backend, int gs) {
 static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type_K, ggml_type type_V, const char * name,
                                            void (*quant_ref_K)(const float *, void *, int64_t),
                                            void (*quant_ref_V)(const float *, void *, int64_t), int n_q,
-                                           int n_kv = 256, int D = 128, float logit_softcap = 0.0f) {
+                                           int n_kv = 256, int D = 128, float logit_softcap = 0.0f,
+                                           float sink_val = NAN) {
+    // sink_val not NaN attaches an attention sink: a per-head logit that competes in the softmax
+    // denominator without owning a V row, so it pulls probability mass away and shrinks the output.
+    // gpt-oss models use them. The vec kernel handles sinks at fattn-vec.hpp:473-501 and no test had
+    // ever set one. Authoritative formula from ggml-cpu/ops.cpp:8628-8642 - the sink participates in
+    // the running max and adds exp(sink - M) to the denominator, leaving the numerator alone.
     // logit_softcap != 0 selects the use_logit_softcap kernel instantiation, which applies
     // softcap * tanh(score) to every KQ score before the mask is added (fattn-vec.hpp). Half of the
     // compiled vec instances carry that template parameter and, until this parameter existed, none
@@ -430,12 +436,19 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/0, /*scale=*/nullptr);
     struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, /*mask=*/nullptr, scale, 0.0f, logit_softcap);
 
+    struct ggml_tensor * sinks = nullptr;
+    if (!std::isnan(sink_val)) {
+        sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);  // one head in this harness
+        ggml_flash_attn_ext_add_sinks(out, sinks);
+    }
+
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
     std::vector<float> host_q(D * n_q);
     for (int c = 0; c < n_q; c++)
         for (int i = 0; i < D; i++) host_q[c*D + i] = sinf(i * 0.1f + 0.3f + c * 0.9f);
     ggml_backend_tensor_set(q, host_q.data(), 0, host_q.size() * sizeof(float));
+    if (sinks) { ggml_backend_tensor_set(sinks, &sink_val, 0, sizeof(float)); }
 
     std::vector<float> host_kv(D * n_kv);
     for (int i = 0; i < D * n_kv; i++) host_kv[i] = sinf(i * 0.05f + 0.7f) * 0.5f;
@@ -499,8 +512,12 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
         }
         float mx = scores[0];
         for (int j = 1; j < n_kv; j++) mx = std::max(mx, scores[j]);
+        // The sink joins the running max and contributes exp(sink - M) to the denominator only,
+        // never to the numerator - it has no V row (ggml-cpu/ops.cpp:8628-8642).
+        if (!std::isnan(sink_val)) mx = std::max(mx, sink_val);
         float sum = 0.0f;
         for (int j = 0; j < n_kv; j++) { scores[j] = expf(scores[j] - mx); sum += scores[j]; }
+        if (!std::isnan(sink_val)) sum += expf(sink_val - mx);
         float inv_sum = 1.0f / sum;
         std::fill(ref_out.begin(), ref_out.end(), 0.0f);
         for (int j = 0; j < n_kv; j++) {
@@ -1017,6 +1034,24 @@ int main() {
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  256, 128, 30.0f);
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 16, 256, 128, 30.0f);
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  256, 256, 30.0f);
+        }
+    }
+
+    // Attention sinks. The vec kernel handles them at fattn-vec.hpp:473-501 and no test had ever set
+    // one; gpt-oss models use them. Two sink magnitudes on purpose: one below the score range so it
+    // barely shifts the denominator, and one above it so the sink wins the running max and forces
+    // the rescale branch (ggml-cpu/ops.cpp:8633-8637), which is the half that would otherwise never
+    // execute.
+    printf("\n=== FA turbo golden parity, attention sinks (previously zero coverage) ===\n");
+    {
+        const asym_cfg sink_cfgs[] = {
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0",      quantize_row_turbo3_0_ref,  quantize_row_turbo3_0_ref },
+            { GGML_TYPE_F16,      GGML_TYPE_F16,      "f16xf16",       quantize_row_f16_ref_wrap,  quantize_row_f16_ref_wrap },
+        };
+        for (const auto & c : sink_cfgs) {
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 128, 0.0f, -2.0f);
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 128, 0.0f,  8.0f);
         }
     }
 
