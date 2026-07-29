@@ -396,7 +396,12 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
                                            void (*quant_ref_K)(const float *, void *, int64_t),
                                            void (*quant_ref_V)(const float *, void *, int64_t), int n_q,
                                            int n_kv = 256, int D = 128, float logit_softcap = 0.0f,
-                                           float sink_val = NAN) {
+                                           float sink_val = NAN, int n_seq = 1) {
+    // n_seq > 1 gives the tensors a fourth dimension, which the kernel turns into
+    // sequence = group(0)/ne02 and then offsets K/V/Q by nb03/nb13/nb23 (fattn-vec.hpp:133-137).
+    // Reachable by default: kv_unified is false (common/common.h:571), so n_stream = n_seq_max
+    // and any -np N gives K->ne[3] = N. Never covered until now, and derived indices under an
+    // untested dimension are exactly the shape of the D=256 defects.
     // sink_val not NaN attaches an attention sink: a per-head logit that competes in the softmax
     // denominator without owning a V row, so it pulls probability mass away and shrinks the output.
     // gpt-oss models use them. The vec kernel handles sinks at fattn-vec.hpp:473-501 and no test had
@@ -425,9 +430,9 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     struct ggml_init_params params = { 64 * 1024 * 1024, NULL, true };
     struct ggml_context * ctx = ggml_init(params);
 
-    struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, 1, 1);
-    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, D, n_kv, 1, 1);
-    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, type_V, D, n_kv, 1, 1);
+    struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_q, 1, n_seq);
+    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, D, n_kv, 1, n_seq);
+    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, type_V, D, n_kv, 1, n_seq);
 
     // Graph: rotate Q with the SAME forward WHT the real model inserts, then flash-attention.
     // group_size 0 = auto, which ggml_turbo_wht resolves to 128 for any 128-aligned ne[0]
@@ -444,18 +449,25 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    std::vector<float> host_q(D * n_q);
-    for (int c = 0; c < n_q; c++)
-        for (int i = 0; i < D; i++) host_q[c*D + i] = sinf(i * 0.1f + 0.3f + c * 0.9f);
+    std::vector<float> host_q((size_t) D * n_q * n_seq);
+    // Distinct data per sequence, so a kernel that ignored nb03 would mix them and be caught.
+    for (int sq = 0; sq < n_seq; sq++)
+        for (int c = 0; c < n_q; c++)
+            for (int i = 0; i < D; i++)
+                host_q[((size_t) sq*n_q + c)*D + i] = sinf(i * 0.1f + 0.3f + c * 0.9f + sq * 2.7f);
     ggml_backend_tensor_set(q, host_q.data(), 0, host_q.size() * sizeof(float));
     if (sinks) { ggml_backend_tensor_set(sinks, &sink_val, 0, sizeof(float)); }
 
-    std::vector<float> host_kv(D * n_kv);
-    for (int i = 0; i < D * n_kv; i++) host_kv[i] = sinf(i * 0.05f + 0.7f) * 0.5f;
+    const size_t kv_elems = (size_t) D * n_kv * n_seq;
+    std::vector<float> host_kv(kv_elems);
+    // Offset per sequence so sequence 1's K/V is not a copy of sequence 0's.
+    for (int sq = 0; sq < n_seq; sq++)
+        for (int i = 0; i < D * n_kv; i++)
+            host_kv[(size_t) sq*D*n_kv + i] = sinf(i * 0.05f + 0.7f + sq * 1.3f) * 0.5f;
 
     std::vector<char> quant_k(ggml_nbytes(k)), quant_v(ggml_nbytes(v));
-    quant_ref_K(host_kv.data(), quant_k.data(), (int64_t) D * n_kv);
-    quant_ref_V(host_kv.data(), quant_v.data(), (int64_t) D * n_kv);
+    quant_ref_K(host_kv.data(), quant_k.data(), (int64_t) kv_elems);
+    quant_ref_V(host_kv.data(), quant_v.data(), (int64_t) kv_elems);
     ggml_backend_tensor_set(k, quant_k.data(), 0, quant_k.size());
     ggml_backend_tensor_set(v, quant_v.data(), 0, quant_v.size());
 
@@ -485,22 +497,28 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     };
 
     // Device-rotated Q read back from the graph WHT node (n_q columns, each its own 128-group).
-    std::vector<float> qr_ref(D * n_q);
+    std::vector<float> qr_ref((size_t) D * n_q * n_seq);
     ggml_backend_tensor_get(qr, qr_ref.data(), 0, qr_ref.size() * sizeof(float));
 
-    // Pre-dequantize all K/V rows once.
-    std::vector<std::vector<float>> k_rows(n_kv, std::vector<float>(D)), v_rows(n_kv, std::vector<float>(D));
-    for (int j = 0; j < n_kv; j++) { dequant_row_k(j, k_rows[j]); dequant_row_v(j, v_rows[j]); }
+    // Pre-dequantize every K/V row of every sequence once. Sequence sq owns rows
+    // [sq*n_kv, (sq+1)*n_kv) because the tensor is contiguous in ne[3].
+    const int n_rows_all = n_kv * n_seq;
+    std::vector<std::vector<float>> k_rows(n_rows_all, std::vector<float>(D)),
+                                    v_rows(n_rows_all, std::vector<float>(D));
+    for (int j = 0; j < n_rows_all; j++) { dequant_row_k(j, k_rows[j]); dequant_row_v(j, v_rows[j]); }
 
-    // FA output layout is {DV, n_head=1, n_q}: column c output at sycl_out[c*D + d].
+    // FA output layout is {DV, n_head=1, n_q, n_seq}: sequence sq column c at (sq*n_q + c)*D.
     bool pass = true;
     float worst_cos = 1.0f, worst_relmse = 0.0f;
     std::vector<float> scores(n_kv), ref_out(D);
-    for (int c = 0; c < n_q; c++) {
-        const float * qc = qr_ref.data() + (size_t) c * D;
+    for (int cc = 0; cc < n_q * n_seq; cc++) {
+        const int sq = cc / n_q;          // sequence index
+        const int c  = cc % n_q;          // column within the sequence
+        const int kv0 = sq * n_kv;        // first K/V row belonging to this sequence
+        const float * qc = qr_ref.data() + (size_t) cc * D;
         for (int j = 0; j < n_kv; j++) {
             float dot = 0.0f;
-            for (int d = 0; d < D; d++) dot += qc[d] * k_rows[j][d];
+            for (int d = 0; d < D; d++) dot += qc[d] * k_rows[kv0 + j][d];
             // ggml divides the scale by the softcap up front (ggml-cpu/ops.cpp: `scale /=
             // logit_softcap` before the loop, then `s = s*scale` and `s = logit_softcap*tanhf(s)`),
             // so the score is softcap*tanh(dot*scale/softcap), not softcap*tanh(dot*scale). Getting
@@ -522,9 +540,9 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
         std::fill(ref_out.begin(), ref_out.end(), 0.0f);
         for (int j = 0; j < n_kv; j++) {
             float p = scores[j] * inv_sum;
-            for (int d = 0; d < D; d++) ref_out[d] += p * v_rows[j][d];
+            for (int d = 0; d < D; d++) ref_out[d] += p * v_rows[kv0 + j][d];
         }
-        const float * sc = sycl_out.data() + (size_t) c * D;
+        const float * sc = sycl_out.data() + (size_t) cc * D;
         float mse = 0, cosv = 0, nr = 0, no = 0;
         for (int d = 0; d < D; d++) {
             float s = sc[d], r = ref_out[d];
@@ -1052,6 +1070,24 @@ int main() {
         for (const auto & c : sink_cfgs) {
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 128, 0.0f, -2.0f);
             success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 128, 0.0f,  8.0f);
+        }
+    }
+
+    // Multi-sequence, ne[3] = 2. The kernel derives sequence = group(0)/ne02 and offsets Q/K/V by
+    // nb03/nb13/nb23 from it (fattn-vec.hpp:133-137); nothing had ever exercised those. It is the
+    // DEFAULT shape, not an exotic one: kv_unified is false (common/common.h:571), so n_stream =
+    // n_seq_max and any -np N gives K->ne[3] = N. Each sequence gets different Q and K/V data, so a
+    // kernel that dropped the nb03/nb13 offsets would mix them and fail rather than silently agree.
+    printf("\n=== FA turbo golden parity, multi-sequence ne[3]=2 (previously zero coverage) ===\n");
+    {
+        const asym_cfg seq_cfgs[] = {
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0",      quantize_row_turbo3_0_ref,  quantize_row_turbo3_0_ref },
+            { GGML_TYPE_F16,      GGML_TYPE_F16,      "f16xf16",       quantize_row_f16_ref_wrap,  quantize_row_f16_ref_wrap },
+        };
+        for (const auto & c : seq_cfgs) {
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1, 256, 128, 0.0f, NAN, 2);
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 8, 256, 128, 0.0f, NAN, 2);
         }
     }
 
