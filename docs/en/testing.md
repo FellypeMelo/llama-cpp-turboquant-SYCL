@@ -100,16 +100,18 @@ Kill any llama-*/test-sycl-* procs before relinking (they hold `ggml-sycl.dll`).
    `build.yml` (which upstream deleted); survives the sync. (The e2e coherence gate SKIPs here — no GPU/model
    on the hosted runners; run it on the self-hosted Arc machine.)
 
-### Recommended turbo KV config (measured 2026-07-09, Qwen3-4B, B580)
-Best KV compression while staying coherent: **`-ctk turbo2 -ctv turbo2`** (auto boundary mode 8) →
-**5.65×** less KV VRAM. Safer default with a larger quality margin: **`-ctk turbo3 -ctv turbo3`** (5.12×).
-Both require `-fa on`. Avoid `TURBO_LAYER_ADAPTIVE=0` with turbo2 (degenerate repetition) and
-`TURBO_LAYER_ADAPTIVE=5/6/7` (SYCL FA abort). Accepted type strings: `turbo2`/`turbo3`/`turbo4`.
+### Recommended turbo KV config (quality measured 2026-07-28, Qwen3-4B, B580)
+**`-ctk q8_0 -ctv turbo3`** - K protected at 8-bit, V compressed, 2.75x less KV VRAM and within
+**0.4%** of f16 perplexity. Requires `-fa on`. Accepted type strings: `turbo2`/`turbo3`/`turbo4`.
+`-ctk f16 -ctv turboN` is the max-precision-K variant (Q stays un-rotated). All six
+`{q8_0,f16} x {turbo2,turbo3,turbo4}` combos dispatch and are gated coherent (head_dim 128).
 
-ASYMMETRIC (precise K + turbo V, "V is free, K is everything"): `-ctk q8_0 -ctv turbo3` is the
-quality-first prod default (K protected at 8-bit, 2.75x), and `-ctk f16 -ctv turboN` the max-precision-K
-mode (Q stays un-rotated). All six `{q8_0,f16} x {turbo2,turbo3,turbo4}` combos dispatch and are gated
-coherent (head_dim=128). NEVER enable turbo-K + turbo-V together.
+Symmetric turbo is memory-first, not a default: `turbo2 x turbo2` is +41.6% perplexity and
+`turbo3 x turbo3` +31.7%, against 5.65x and 5.12x memory saved. `turbo4 x turbo4` (+5.1%) is the
+only symmetric config inside a 5% budget. Until 2026-07-28 this section recommended the symmetric
+configs, because coherence was the only evidence available and coherence does not measure quality.
+Avoid `TURBO_LAYER_ADAPTIVE=0` with turbo2 (degenerate repetition) and `TURBO_LAYER_ADAPTIVE=5/6/7`
+(SYCL FA abort).
 
 ## First-run note
 SYCL JIT-compiles all kernels on first launch (slow warmup). Set `SYCL_CACHE_PERSISTENT=1` so kernels

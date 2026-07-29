@@ -19,6 +19,11 @@ Each pair covers the same content, same structure, same headings, same order —
 language you read more comfortably. Code blocks, commands, identifiers, paths and error strings are
 identical in both.
 
+**One exception, and it matters:** `pt-BR/decisions.md` is the ADR file of record and runs to
+ADR-0011. `en/decisions.md` carries ADR-0001 through ADR-0005 in full and ADR-0006 onward in
+condensed form. The condensed entries state the decision, the reason and the consequence; the full
+reasoning, measurements and rejected alternatives are only in the Portuguese file.
+
 Two fork-owned documents are intentionally **not** mirrored here and stay where they are, at the
 repository root:
 

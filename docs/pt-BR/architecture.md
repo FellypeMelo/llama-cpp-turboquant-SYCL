@@ -113,7 +113,9 @@ Economia vs. fp16 @64k: **turbo2 5,6×** (modo adaptativo 8; turbo2 puro = 7,5×
 | 8k | 57,6 | 28,9 | 26,1 |
 | 32k | 33,9 | 10,1 | 8,9 |
 
-O decode turbo fica mais lento em contexto profundo — **mas isso não é um defeito do TurboQuant.** O `q8_0` colapsa de forma **idêntica** (o turbo3 inclusive supera ele em profundidade). O gargalo é o dequant por elemento dentro do loop interno do VEC, inerente a **todo** decode de KV quantizado; o f16 só continua rápido porque pula o dequant. Então o turbo entrega velocidade de decode na classe do `q8_0` **com até 2,7× menos memória que o `q8_0`** — essa é a vitória. Fechar o gap para o f16 em profundidade exigiria um kernel de decode fundamentalmente diferente (o caminho VEC da CUDA também não fecha).
+O decode turbo fica mais lento em contexto profundo — **mas isso não é um defeito do TurboQuant.** O `q8_0` colapsa de forma **idêntica** (o turbo3 inclusive supera ele em profundidade). Então o turbo entrega velocidade de decode na classe do `q8_0` **com até 2,7× menos memória que o `q8_0`** — essa é a vitória.
+
+O que este parágrafo afirmava antes, e estava errado: que o gargalo era "inerente a todo KV quantizado" e exigiria um kernel fundamentalmente diferente. A causa é **roteamento estrutural**, não quantização. O f16 vai para o TILE batched por GQA, que desquantiza cada linha de K/V uma vez e compartilha o resultado com todo o grupo GQA; todo tipo quantizado é forçado para o VEC com `ncols2` fixado em 1 (`ggml/src/ggml-sycl/fattn-vec.hpp`), então o VEC relê cada linha uma vez por cabeça de query — cerca de 4× o trabalho em GQA 4:1. É endereçável; só não foi endereçado.
 
 ## 7. O que foi explorado e conscientemente adiado
 
@@ -125,8 +127,8 @@ O decode turbo fica mais lento em contexto profundo — **mas isso não é um de
 
 - **Teste primeiro, em silício real** — uma referência golden de CPU + um teste de paridade numérica no device travam cada mudança; nada de "parece coerente" no olhômetro.
 - **Reaproveitar em vez de reescrever** — a correção do prefill reaproveita o kernel f16 TILE já comprovado em vez de escrever à mão um loader de tile de baixa precisão frágil.
-- **Falhar com segurança, não com estrondo** — caminhos não suportados (context-shift turbo, head dims fora de 128) recuam graciosamente em vez de abortar.
-- **Benchmarking honesto** — o colapso em profundidade é reportado, tem a causa raiz identificada e é mostrado como comum a todo KV quantizado, não escondido.
+- **Falhar com segurança, mas avisando** — caminhos não suportados (context-shift turbo, head dims não cobertos) recuam em vez de abortar. Recuar em silêncio virou um defeito por si só: um head_dim não coberto joga a operação de atenção inteira para o backend de CPU a ~10× o custo, e nenhum gate enxerga isso — então os fallbacks agora avisam na construção do cache (ADR-0008/0011).
+- **Benchmarking honesto** — o colapso em profundidade é reportado e tem causa raiz. A causa raiz foi corrigida uma vez: não é "comum a todo KV quantizado" como estava escrito, é que os tipos quantizados são forçados para o kernel VEC enquanto o f16 pega o TILE batched por GQA.
 - **Entrega reprodutível** — um pipeline de CI/CD dedicado (`.github/workflows/tqp-sycl.yml`) constrói automaticamente Windows + Linux SYCL a cada push e publica pacotes de release autocontidos.
 
 ## 9. Usando
@@ -134,8 +136,11 @@ O decode turbo fica mais lento em contexto profundo — **mas isso não é um de
 ```bash
 # Cache KV turbo — requer flash-attention
 llama-server -m model.gguf -ngl 99 --flash-attn on \
-             --cache-type-k turbo3 --cache-type-v turbo3 -c 32768
+             --cache-type-k q8_0 --cache-type-v turbo3 -c 32768
 ```
+
+Quantizar o **K** custa ~30% de perplexidade; o **V**, ~0,4%. Por isso a config é K preciso + V turbo,
+e não turbo dos dois lados. Medições em [benchmarks.md](benchmarks.md).
 
 Strings aceitas por `--cache-type-k` / `-v`: **`turbo2`**, **`turbo3`**, **`turbo4`**. Requer `--flash-attn on`. Em GPUs Intel, defina `SYCL_CACHE_PERSISTENT=1` uma vez para que o JIT do SYCL guarde os kernels compilados em disco (o primeiro lançamento compila todos os kernels — do contrário a partida parece lenta).
 

@@ -84,8 +84,15 @@ Baixe um pacote pré-compilado e autocontido na [**página de Releases**](https:
 ```bash
 # Cache KV turbo — requer flash-attention. Tipos: turbo2 / turbo3 / turbo4
 llama-server -m model.gguf -ngl 99 --flash-attn on \
-             --cache-type-k turbo3 --cache-type-v turbo3 -c 32768
+             --cache-type-k q8_0 --cache-type-v turbo3 -c 32768
 ```
+
+Mantenha o **K** em `q8_0` e comprima só o **V**. Perplexidade no wikitext-2 (Qwen3-4B Q4_K_M): essa
+config fica a **0,4%** do f16, enquanto a simétrica `-ctk turbo3 -ctv turbo3` custa **+31,7%** —
+quantizar o K é o que dói, o V sai quase de graça. A simétrica maximiza a economia de memória e ainda
+gera texto coerente, e foi por isso que ela era recomendada aqui antes de o gate de perplexidade ter
+sido rodado pela primeira vez; não use sem antes medir se a perda de qualidade serve para o seu caso.
+Números completos em [docs/en/benchmarks.md](docs/en/benchmarks.md).
 
 Em GPUs Intel, defina `SYCL_CACHE_PERSISTENT=1` uma vez para que o JIT do SYCL guarde os kernels compilados em disco (a primeira execução compila todos os kernels).
 

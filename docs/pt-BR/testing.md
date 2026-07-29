@@ -109,18 +109,18 @@ retoma de onde parou. Mate qualquer processo llama-*/test-sycl-* antes de relink
    upstream (que o upstream removeu); sobrevive ao sync. (O gate e2e de coerência faz SKIP aqui — sem
    GPU/modelo nos runners hospedados; rode-o na máquina Arc self-hosted.)
 
-### Configuração recomendada de KV turbo (medida em 2026-07-09, Qwen3-4B, B580)
-Melhor compressão de KV mantendo coerência: **`-ctk turbo2 -ctv turbo2`** (modo 8 de borda
-automática) → **5,65×** menos VRAM de KV. Default mais seguro, com margem de qualidade maior:
-**`-ctk turbo3 -ctv turbo3`** (5,12×). Ambos exigem `-fa on`. Evite `TURBO_LAYER_ADAPTIVE=0` com
-turbo2 (repetição degenerada) e `TURBO_LAYER_ADAPTIVE=5/6/7` (abort no FA do SYCL). Strings de tipo
-aceitas: `turbo2`/`turbo3`/`turbo4`.
+### Configuração recomendada de KV turbo (qualidade medida em 2026-07-28, Qwen3-4B, B580)
+**`-ctk q8_0 -ctv turbo3`** — K protegido em 8 bits, V comprimido, 2,75× menos VRAM de KV e a **0,4%**
+da perplexidade do f16. Exige `-fa on`. Strings de tipo aceitas: `turbo2`/`turbo3`/`turbo4`.
+`-ctk f16 -ctv turboN` é a variante de K com precisão máxima (Q fica não-rotacionado). Todas as seis
+combinações `{q8_0,f16} x {turbo2,turbo3,turbo4}` fazem dispatch e são gated como coerentes (head_dim 128).
 
-ASSIMÉTRICO (K preciso + V turbo, "V é de graça, K é tudo"): `-ctk q8_0 -ctv turbo3` é o default de
-produção com prioridade em qualidade (K protegido em 8 bits, 2,75×), e `-ctk f16 -ctv turboN` é o
-modo de K com precisão máxima (Q fica não-rotacionado). Todas as seis combinações `{q8_0,f16} x
-{turbo2,turbo3,turbo4}` fazem dispatch e são gated como coerentes (head_dim=128). NUNCA habilite
-turbo-K + turbo-V juntos.
+Turbo simétrico é memória-primeiro, não default: `turbo2 x turbo2` custa +41,6% de perplexidade e
+`turbo3 x turbo3` +31,7%, contra 5,65× e 5,12× de memória economizada. `turbo4 x turbo4` (+5,1%) é o
+único simétrico dentro de um orçamento de 5%. Até 2026-07-28 esta seção recomendava as simétricas,
+porque coerência era a única evidência disponível — e coerência não mede qualidade. Evite
+`TURBO_LAYER_ADAPTIVE=0` com turbo2 (repetição degenerada) e `TURBO_LAYER_ADAPTIVE=5/6/7` (abort no
+FA do SYCL).
 
 ## Nota sobre a primeira execução
 O SYCL compila os kernels via JIT no primeiro lançamento (warmup lento). Defina

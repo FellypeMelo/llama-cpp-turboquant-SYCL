@@ -1,6 +1,13 @@
 # TurboQuant SYCL Backend — Implementation & Engineering Playbook
 
-This document is the Single Source of Truth for the development, architecture, and optimization of the TurboQuant SYCL backend for `llama.cpp`. It is designed to accelerate implementation velocity and ensure architectural consistency for both human engineers and AI agents.
+> **This file is NOT the source of truth.** It is an early design playbook, kept for the background
+> it gives on the TurboQuant method itself. The authoritative documents are [`AGENTS.md`](AGENTS.md)
+> (rules), [`CLAUDE.md`](CLAUDE.md) (current architecture and state) and
+> [`docs/pt-BR/decisions.md`](docs/pt-BR/decisions.md) (ADRs). Where this file disagrees with those,
+> they win. Sections below describing implementation state are stale by design - do not update them
+> in place, and do not act on them without checking the code first.
+
+This document was written as the Single Source of Truth for the development, architecture, and optimization of the TurboQuant SYCL backend for `llama.cpp`. It is designed to accelerate implementation velocity and ensure architectural consistency for both human engineers and AI agents.
 
 ---
 
@@ -8,9 +15,13 @@ This document is the Single Source of Truth for the development, architecture, a
 
 **TurboQuant (TQ)** is a high-performance quantization suite (2, 3, 4-bit) based on PolarQuant/QJL (ICLR 2026). It utilizes the Fast Walsh-Hadamard Transform (WHT) to rotate tensors into a domain where Lloyd-Max quantization is highly effective, enabling aggressive KV cache and weight compression with minimal perplexity loss.
 
-**SYCL Backend Maturity**: **Partial Prototype (Skeleton Functional)**.
-*   **Target Hardware**: Intel Arc Graphics (A-series, B-series), Intel Data Center GPU Max (PVC), and integrated Xe Graphics.
-*   **Current State**: `TURBO3_0` KV cache is functional via the Flash Attention (Vec) path. Weight quantization (`TQ3_1S`, `TQ4_1S`) kernels and hardware acceleration (XMX/DPAS) are fundamentally missing.
+**SYCL Backend Maturity** (superseded - see CLAUDE.md for the current state; kept to show what the
+original plan assumed): the playbook was written when the backend was a partial prototype, with only
+`TURBO3_0` KV functional via the FA-vec path. Since then turbo2/3/4 KV all work, prefill reaches f16
+parity through the dequant-to-f16 TILE shim, head_dim 64/128/256 is covered, and quality has been
+measured (turbo on K costs ~30% perplexity, on V ~0.4%). Weight quantization (`TQ3_1S`, `TQ4_1S`) and
+XMX/DPAS acceleration are still absent, and the XMX prefill kernel is parked on purpose.
+*   **Target Hardware**: Intel Arc Graphics (A-series, B-series), Intel Data Center GPU Max (PVC), and integrated Xe Graphics. Only Arc B580 (`bmg_g21`) is validated.
 *   **Goal**: 100% feature parity with CUDA/Metal, fully optimized for Xe-core systolic arrays.
 
 ---

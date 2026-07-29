@@ -140,9 +140,16 @@ NUNCA habilitar turbo-K + turbo-V juntos (assimetria = só UM lado turbo).
 
 - **Sim, o turbo KV gera coerente** — para as configs **simétricas SYCL-safe**: `turbo3/turbo3`,
   `turbo4/turbo4` e `turbo2/turbo2` (com a borda auto mode 8). Decode ~74 t/s (≈ f16 77 t/s, −4%).
-- **Config ÓTIMA (melhor compressão mantendo coerência):** **`-ctk turbo2 -ctv turbo2`** (auto mode 8) →
-  **5.65× menos VRAM de KV**, coerente. Se quiser margem de qualidade maior por ~10% menos economia, o
-  **default recomendado é `-ctk turbo3 -ctv turbo3`** (5.12×, uniforme, sem depender da borda).
+- **A config recomendada é `-ctk q8_0 -ctv turbo3`**, nenhuma das simétricas. Esta seção chamava
+  originalmente `-ctk turbo2 -ctv turbo2` de "ÓTIMA" (5,65× menos VRAM de KV) e `-ctk turbo3 -ctv
+  turbo3` de "default recomendado" (5,12×). As duas afirmações saíram em 2026-07-09 apoiadas só em
+  coerência; o gate de perplexidade rodou pela primeira vez em 2026-07-28 e as derrubou — turbo2
+  simétrico é **+41,6%** de PPL e turbo3 simétrico **+31,7%**, contra **+0,4%** do `q8_0 x turbo3`
+  (tabela de qualidade neste documento). Texto coerente era o instrumento errado: um modelo 32% pior
+  em perplexidade continua escrevendo frases fluentes, então o gate e2e não tinha como pegar isso — e
+  não pegou.
+- Turbo simétrico continua correto e suportado; é um tradeoff memória-primeiro, não um default. Se
+  precisar de simétrico, `turbo4 x turbo4` (+5,1%) é o único dentro de um orçamento de 5%.
 - **Depende do modo:** turbo2 **uniforme** (`TURBO_LAYER_ADAPTIVE=0`) degrada (repetição) — evitar.
   `TURBO_LAYER_ADAPTIVE=5/6/7` (bordas com tipos turbo mistos) **abortam** no FA-vec SYCL
   (`fattn.cpp:166`). Misto turbo-K/q8_0-V roda mas é marcado não-confiável no código — não recomendado.

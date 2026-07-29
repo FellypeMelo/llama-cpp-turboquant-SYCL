@@ -180,8 +180,8 @@ It is **not** a free fix. A read-only design pass established that `launch_fattn
 
 - **Test-first on real silicon** — a CPU golden reference + on-device numerical parity test gate every change; no "looks coherent" hand-waving.
 - **Reuse over rewrite** — the prefill fix reuses the proven f16 TILE kernel instead of hand-rolling a fragile low-bit tile loader.
-- **Fail safe, not loud** — unsupported paths (turbo context-shift, non-128 head dims) fall back gracefully rather than abort.
-- **Honest benchmarking** — depth collapse is reported, root-caused, and shown to be common to all quantized KV, not hidden.
+- **Fail safe, but say so** — unsupported paths (turbo context-shift, uncovered head dims) fall back rather than abort. Falling back silently turned out to be its own defect: an unsupported head_dim moves the whole attention op to the CPU backend at roughly 10x the cost, and no gate can see it, so the fallbacks now warn at cache construction (ADR-0008/0011).
+- **Honest benchmarking** — depth collapse is reported and root-caused. The root cause was corrected once: it is not "common to all quantized KV" as originally written, it is that quantized types are forced onto the VEC kernel while f16 gets the GQA-batched TILE.
 - **Reproducible delivery** — a dedicated CI/CD pipeline (`.github/workflows/tqp-sycl.yml`) auto-builds Windows + Linux SYCL on every push and publishes self-contained release packages.
 
 ## 9. Using it

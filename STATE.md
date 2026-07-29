@@ -26,8 +26,11 @@ _Atualizado: 2026-07-09. Estado vivo do projeto. Ler junto com `TURBO_HANDOFF.md
   labels `e2e;gpu;turbo`, SKIP 77 sem modelo) — **VERDE** via ctest na B580 (~15 s). Matriz completa medida
   (f16→turbo2) em `docs/pt-BR/benchmarks.md`. **Veredito: turbo KV gera COERENTE** nas simétricas SYCL-safe
   (`turbo3/turbo3` 5.12×, `turbo4/turbo4` 3.76×, `turbo2/turbo2` auto-mode-8 5.65×; decode ~74 t/s ≈ f16).
-  **Config ÓTIMA (máx. compressão coerente): `-ctk turbo2 -ctv turbo2`** (5.65× menos VRAM-KV); default
-  robusto `turbo3/turbo3`. Achados honestos: turbo2 uniforme (`TURBO_LAYER_ADAPTIVE=0`) DEGRADA (repetição);
+  **NOTA (2026-07-28):** este item dizia **"Config ÓTIMA: `-ctk turbo2 -ctv turbo2`"** (5,65× menos VRAM-KV)
+  com default robusto `turbo3/turbo3`. O gate de perplexidade rodou depois e derrubou as duas: turbo2
+  simétrico é +41,6% de PPL, turbo3 simétrico +31,7%. A config recomendada é **`-ctk q8_0 -ctv turbo3`**
+  (+0,4%). Coerência era o instrumento errado — o e2e continua verde nas simétricas e sempre esteve certo
+  sobre coerência; ele só nunca mediu qualidade. Achados honestos: turbo2 uniforme (`TURBO_LAYER_ADAPTIVE=0`) DEGRADA (repetição);
   `TURBO_LAYER_ADAPTIVE=5/6/7` ABORTAM (`fattn.cpp:166`, tipos K/V turbo mistos). Auto-assimétrica NÃO
   engaja p/ Qwen3-4B (GQA 4:1 < limiar 6) — correto.
 

@@ -8,13 +8,13 @@ stated.
 
 ## Correctness / quality gates not yet closed
 
-- **PPL / speed quality gate** (`scripts/turbo-quality-gate.sh`) — exists and is wired into the test
-  suite, but has not been run end-to-end. It needs a locally available pure-attention reference
-  model (the validated target is Qwen3-4B) plus a `wikitext-2-raw` dataset; neither has been present
-  on the validation machine in the sessions documented so far. The golden cosine-similarity gate
-  (see `docs/en/testing.md`) passes and proves numerical kernel parity, but that is not the same
-  claim as a measured perplexity delta — until this gate runs, the quality story rests on the golden
-  gate plus the qualitative e2e-coherence samples in `docs/en/benchmarks.md`.
+- **PPL / speed quality gate** (`scripts/turbo-quality-gate.sh`) — **CLOSED on 2026-07-28.** It ran
+  for the first time (wikitext-2, Qwen3-4B Q4_K_M, `-c 512 --chunks 32`) and produced the most
+  consequential measurement this fork has: turbo on **V** costs ~0.4% perplexity, turbo on **K**
+  ~30%. That overturned the previously recommended symmetric configs and made `-ctk q8_0 -ctv turbo3`
+  the recommendation. Numbers in `docs/en/benchmarks.md`. Two things stay open: the gate is still
+  manual (not on a schedule against the Arc runner), and the golden test remains structurally blind
+  to this class of defect because it quantizes K and V identically, so quantization error cancels.
 - **Perplexity rescue on a second GQA ratio** — the asymmetric K/V work (ADR-0005) was validated on
   Qwen3-4B (GQA 4:1); a confirmation run on a model with a different GQA ratio (a Qwen2.5-class 7:1
   model was the intended target) is pending. The auto-asymmetric K-upgrade logic has a GQA≥6

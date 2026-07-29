@@ -153,10 +153,15 @@ NEVER enable turbo-K + turbo-V together (asymmetry = only ONE side turbo).
 - **Yes, turbo KV generates coherently** — for the **SYCL-safe symmetric configs**: `turbo3/turbo3`,
   `turbo4/turbo4` and `turbo2/turbo2` (with the auto mode-8 boundary). Decode ~74 t/s (≈ f16's 77
   t/s, −4%).
-- **OPTIMAL config (best compression while staying coherent): `-ctk turbo2 -ctv turbo2`** (auto
-  mode 8) → **5.65× less KV VRAM**, coherent. If you want a larger quality margin for ~10% less
-  savings, the **recommended default is `-ctk turbo3 -ctv turbo3`** (5.12×, uniform, not dependent
-  on the boundary).
+- **The recommended config is `-ctk q8_0 -ctv turbo3`**, not either symmetric one. This section
+  originally named `-ctk turbo2 -ctv turbo2` "OPTIMAL" (5.65x less KV VRAM) and `-ctk turbo3 -ctv
+  turbo3` the "recommended default" (5.12x). Both statements were made on 2026-07-09 from coherence
+  evidence alone; the perplexity gate first ran on 2026-07-28 and overturned them - symmetric turbo2
+  is **+41.6%** PPL and symmetric turbo3 **+31.7%**, against **+0.4%** for `q8_0 x turbo3` (see the
+  quality table in this document). Coherent text was the wrong instrument: a model 32% worse in
+  perplexity still writes fluent sentences, so the e2e gate could not have caught this and did not.
+- Symmetric turbo remains correct and supported; it is a memory-first tradeoff, not a default. If
+  you need symmetric, `turbo4 x turbo4` (+5.1%) is the only one inside a 5% budget.
 - **It depends on the mode:** **uniform** turbo2 (`TURBO_LAYER_ADAPTIVE=0`) degrades (repetition) —
   avoid it. `TURBO_LAYER_ADAPTIVE=5/6/7` (mixed-turbo-type boundaries) **abort** in SYCL FA-vec
   (`fattn.cpp:166`). Mixed turbo-K/q8_0-V runs but is marked unreliable in code — not recommended.

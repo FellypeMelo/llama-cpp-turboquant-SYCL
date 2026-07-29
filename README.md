@@ -71,7 +71,7 @@ All numbers below come from the maintainer's own `llama-bench` / `llama-cli` run
 
 fp16 @64k nearly OOMs the 12 GB card; turbo runs the same 64k with 6+ GB free (~256k context reachable). Prefill matches fp16 at every length tested — see [Architecture](#architecture) for why.
 
-**On the decode row — two runs, not one number:** the session behind this table measured f16 75.6 / q8_0 71.8 / turbo3 70.4 t/s at depth 0. A separate benchmark session, recorded in the deep-dive's own decode-at-depth table (`docs/en/architecture.md`, §6), measured the same metric on the same hardware and model as f16 75.9 / q8_0 72.3 / turbo3 70.8 — a ~0.3–0.5 t/s spread consistent with ordinary run-to-run noise between two separate `llama-bench` invocations, not a change in behavior. Both figures are real measurements; neither is presented here as the single "correct" one. What both runs agree on: turbo decode tracks `q8_0` closely at shallow context and, like `q8_0`, slows down at deep context, because both formats pay a per-element dequant cost inside the decode inner loop that fp16 skips. See §6 of the deep-dive for the full depth table and why this is a property of quantized KV in general, not a TurboQuant-specific regression.
+**On the decode row — two runs, not one number:** the session behind this table measured f16 75.6 / q8_0 71.8 / turbo3 70.4 t/s at depth 0. A separate benchmark session, recorded in the deep-dive's own decode-at-depth table (`docs/en/architecture.md`, §6), measured the same metric on the same hardware and model as f16 75.9 / q8_0 72.3 / turbo3 70.8 — a ~0.3–0.5 t/s spread consistent with ordinary run-to-run noise between two separate `llama-bench` invocations, not a change in behavior. Both figures are real measurements; neither is presented here as the single "correct" one. What both runs agree on: turbo decode tracks `q8_0` closely at shallow context and, like `q8_0`, slows down at deep context. This is not a TurboQuant-specific regression - but it is also not, as this section previously claimed, an inherent property of quantized KV. The cause is structural routing: fp16 decode reaches the GQA-batched TILE kernel, which dequantizes each K/V row once and shares it across the whole GQA group, while every quantized type is forced onto the VEC kernel with `ncols2` hardcoded to 1 (`ggml/src/ggml-sycl/fattn-vec.hpp`), so VEC re-reads each row once per query head - about 4x the work at GQA 4:1. Addressable in principle, not yet addressed. See §6 of the deep-dive for the depth table.
 
 **A separate build configuration roughly doubles prefill — labeled separately on purpose:** with `GGML_SYCL_F16=ON` plus ahead-of-time device compilation (`GGML_SYCL_DEVICE_ARCH=bmg-g21`), a 2026-07-09 benchmark measured baseline pp512 1246.70 ± 2.87 t/s vs. 2528.80 ± 18.62 t/s with those two flags on (+102.8%), with decode essentially flat (−3.3%, within noise) and the golden correctness test still green. That is a different binary than the one produced by the Quick start below and than the table above (`GGML_SYCL_F16` is off, and there is no AOT compile, in the default build) — see [`docs/en/benchmarks.md`](docs/en/benchmarks.md) and [`docs/en/testing.md`](docs/en/testing.md) for the exact flags and how to build it.
 
@@ -82,8 +82,15 @@ Download a pre-built self-contained package from the [**Releases page**](https:/
 ```bash
 # Turbo KV cache — requires flash-attention. Types: turbo2 / turbo3 / turbo4
 llama-server -m model.gguf -ngl 99 --flash-attn on \
-             --cache-type-k turbo3 --cache-type-v turbo3 -c 32768
+             --cache-type-k q8_0 --cache-type-v turbo3 -c 32768
 ```
+
+Keep **K** at `q8_0` and compress only **V**. Perplexity on wikitext-2 (Qwen3-4B Q4_K_M): this config
+lands within **0.4%** of f16, while symmetric `-ctk turbo3 -ctv turbo3` costs **+31.7%** — quantizing
+K is what hurts, and V is nearly free. Symmetric turbo maximizes memory savings and still generates
+coherent text, which is why it was recommended here before the perplexity gate was ever run; do not
+use it unless you have measured that the quality loss is acceptable for your task. Full numbers in
+[docs/en/benchmarks.md](docs/en/benchmarks.md).
 
 On Intel GPUs, set `SYCL_CACHE_PERSISTENT=1` once so the SYCL JIT caches compiled kernels to disk (first launch compiles all kernels).
 
@@ -121,7 +128,7 @@ Everything else follows the standard `llama.cpp` layout described in the unmodif
 
 Deliberately deferred or still open, per the engineering notes in [`docs/en/architecture.md`](docs/en/architecture.md) and the full [`docs/en/roadmap.md`](docs/en/roadmap.md):
 
-- **PPL / speed quality gate** (`scripts/turbo-quality-gate.sh`) — wired up but not yet run end-to-end; needs a pure-attention reference model plus a local `wikitext-2-raw` dataset. The golden cosine-similarity gate (Testing & CI, item 1) passes, but that proves numerical parity, not a measured perplexity delta.
+- **PPL / speed quality gate** (`scripts/turbo-quality-gate.sh`) — **run for the first time on 2026-07-28** (wikitext-2, Qwen3-4B Q4_K_M, `-c 512 --chunks 32`) and it changed the recommended configuration: turbo on V costs ~0.4%, turbo on K ~30%. The numbers are in [`docs/en/benchmarks.md`](docs/en/benchmarks.md). It is not yet wired into a scheduled CI run on the Arc machine, so it remains a manual gate.
 - **XMX (`joint_matrix`) prefill kernel** — a proof-of-concept confirmed Intel's matrix engine works for this on the B580 (one fp16→f32 DPAS tile, error 1e-10), but it is parked: prefill is already at fp16 parity via the dequant-to-f16 path, so the projected additional gain (~1.6% at pp512) does not currently justify the added kernel complexity.
 - **Native head_dim=64 support and turbo K-shift** — scoped but not implemented. Context-shift on a turbo-quantized cache currently disables gracefully (`get_can_shift()` returns `false`) rather than crashing or being supported.
 - **CUDA / Metal / Vulkan turbo support** — present in the codebase from earlier phases of this fork's history (see `ggml/src/ggml-metal/turbo-matrices.h` and the CUDA/Vulkan dispatch paths), but SYCL on Intel Arc is the only backend covered by the gates in Testing & CI; the other backends are best-effort and not currently re-validated on every sync.
