@@ -392,8 +392,12 @@ static bool run_wht_roundtrip_test(ggml_backend_t backend, int gs) {
 static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type_K, ggml_type type_V, const char * name,
                                            void (*quant_ref_K)(const float *, void *, int64_t),
                                            void (*quant_ref_V)(const float *, void *, int64_t), int n_q,
-                                           int n_kv = 256) {
-    const int D      = 128;   // head dim == QK_TURBO block size
+                                           int n_kv = 256, int D = 128) {
+    // head dim. 128 is one QK_TURBO block per row; 256 is two, which is the shape that made a
+    // head_dim-256 model lose SYCL flash-attention entirely and fall back to the CPU.
+    // The WHT group is fixed at 128 (QK_TURBO3_GROUP), so D=256 is two independent rotations and
+    // the CPU golden below needs no special casing - it quantizes the whole D-length row with the
+    // same reference quantizer, which walks block by block.
     // n_kv must be a multiple of FATTN_KQ_STRIDE. The default 256 gives ntiles_KQ = 2, which barely
     // engages the split-KV path; pass a deep n_kv to force parallel_blocks > 1 in launch_fattn and
     // exercise flash_attn_combine_results.
@@ -411,7 +415,10 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     struct ggml_tensor * v = ggml_new_tensor_4d(ctx, type_V, D, n_kv, 1, 1);
 
     // Graph: rotate Q with the SAME forward WHT the real model inserts, then flash-attention.
-    struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/D, /*scale=*/nullptr);
+    // group_size 0 = auto, which ggml_turbo_wht resolves to 128 for any 128-aligned ne[0]
+    // (ggml.c) - the same value llama-graph.cpp derives. The WHT group is a property of the
+    // turbo format, not of head_dim, so D=256 is two independent 128-rotations per row.
+    struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/0, /*scale=*/nullptr);
     struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, /*mask=*/nullptr, scale, 0.0f, 0.0f);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -671,7 +678,7 @@ static bool run_fattn_turbo_decode_mask_gqa(ggml_backend_t backend, ggml_type ty
     struct ggml_tensor * v    = ggml_new_tensor_4d(ctx, type_V, D, n_kv, n_head_kv, 1);
     struct ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
 
-    struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/D, /*scale=*/nullptr);
+    struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/0, /*scale=*/nullptr);
     struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, mask, scale, 0.0f, 0.0f);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -942,6 +949,15 @@ int main() {
     printf("\n=== FA turbo DECODE+GQA+padding-mask, MIXED-WIDTH turbo4-K x cheaper-turbo-V ===\n");
     for (const auto & c : mixed_cfgs)
         success &= run_fattn_turbo_decode_mask_gqa(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V);
+
+    // head_dim 256 is NOT covered: FATTN_VEC_CASES_TURBO_D caps turbo at D in {64,128}. Attempted
+    // 2026-07-29 and reverted. The blocker is shared local memory, not registers as the macro's
+    // comment claims: ne_combine = nwarps*V_cols_per_iter*D is 8*8*256 = 64 KB at D=256, which is
+    // the Xe2 per-work-group ceiling, so the kernel fails to JIT and takes the whole program with
+    // it (D=128 stops working too). Lowering nthreads_V shrinks that, but the turbo V dequant
+    // assumes each lane covers a whole 128-block, and breaking that gave golden cosine -0.34.
+    // Both directions are blocked, so D=256 needs real kernel work. Until then a head_dim-256
+    // model gets a warning at load (llama-kv-cache.cpp) and runs attention on the CPU.
 
     // Deep context. Every case above runs at n_kv=256, i.e. ntiles_KQ=2, so launch_fattn almost
     // never picks parallel_blocks > 1 and flash_attn_combine_results stays largely unexercised.

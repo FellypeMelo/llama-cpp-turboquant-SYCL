@@ -389,6 +389,23 @@ llama_kv_cache::llama_kv_cache(
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
         const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
+        // The SYCL turbo flash-attention kernels only exist for head_dim 64 and 128
+        // (FATTN_VEC_CASES_TURBO_D). Outside that, ggml_sycl_flash_attn_ext_supported returns false
+        // and ggml quietly runs attention on the CPU: correct results, roughly 10x slower prefill,
+        // with nothing in the log to say why. Measured on a head_dim-256 model (Arc B580, pp2048):
+        // q8_0 x turbo3 139 t/s against 1401 for q8_0 x q8_0. Say so once, at load.
+        {
+            const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 ||
+                                     layer_type_v == GGML_TYPE_TURBO4_0 ||
+                                     layer_type_v == GGML_TYPE_TURBO2_0);
+            const uint32_t hd = hparams.n_embd_head_k(il);
+            if (il == 0 && (k_is_turbo || v_is_turbo) && hd != 64 && hd != 128) {
+                LLAMA_LOG_WARN("%s: turbo KV requested but head_dim is %u; the SYCL turbo kernels "
+                               "cover only 64 and 128, so flash-attention will fall back to the CPU "
+                               "and prefill will be far slower. Prefer -ctk q8_0 -ctv q8_0 on this "
+                               "model.\n", __func__, hd);
+            }
+        }
         if (k_is_turbo && n_embd_head_k % 128 != 0) {
             const uint32_t padded_head_k = ((n_embd_head_k + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
