@@ -77,6 +77,7 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
 struct run_result {
     std::vector<float> logits;
     std::string        warnings;
+    bool               can_shift = false;
     bool               ok = false;
 };
 
@@ -102,6 +103,11 @@ static run_result run(llama_model * model, ggml_type type_k, ggml_type type_v, i
     for (int i = 0; i < 32; i++) {
         tokens.push_back((llama_token) ((i*7 + 3) % n_vocab));
     }
+
+    // Context shift derives its view strides from hparams.n_embd_k_gqa, so it is wrong on a padded
+    // cache and llama_kv_cache::get_can_shift() must refuse. The old guard only tested for a turbo
+    // K type, which stopped covering the padded case once a non-turbo K started being padded too.
+    res.can_shift = llama_memory_can_shift(llama_get_memory(ctx));
 
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
     if (llama_decode(ctx, batch) != 0) {
@@ -161,7 +167,18 @@ int main() {
         llama_backend_free();
         return 1;
     }
-    printf("f16 x f16 reference: %zu logits\n", ref.logits.size());
+    printf("f16 x f16 reference: %zu logits, shift %s\n",
+           ref.logits.size(), ref.can_shift ? "allowed" : "refused");
+
+    // Control for the shift assertions below. f16 x f16 is never padded, so context shift must still
+    // be ALLOWED here. Without this, a get_can_shift() guard that is too broad - refusing on every
+    // cache rather than only padded ones - would silently disable context shift for every user and
+    // every config, and the per-config "shift refused" checks would all still pass.
+    if (!ref.can_shift) {
+        printf("FAIL: context shift refused on an unpadded f16 cache; the get_can_shift() guard is\n");
+        printf("      too broad and has disabled context shift for configurations that never pad\n");
+        failures++;
+    }
 
     struct cfg {
         const char * name;
@@ -203,10 +220,16 @@ int main() {
 
         const bool dispatch_ok = (c.expect_gpu != fell_back);
 
-        printf("  %-4s %-16s: nmse %.3e, %s\n",
-               (numeric_ok && dispatch_ok) ? "PASS" : "FAIL",
+        // Every config here pads the cache (head_dim 64 -> 128), so context shift must be refused.
+        // Allowed, build_graph_shift would stride the padded rows as if they were narrow and corrupt
+        // K silently - correct-looking output, wrong cache.
+        const bool shift_ok = !r.can_shift;
+
+        printf("  %-4s %-16s: nmse %.3e, %s, shift %s\n",
+               (numeric_ok && dispatch_ok && shift_ok) ? "PASS" : "FAIL",
                c.name, err,
-               fell_back ? "FELL BACK TO CPU" : "dispatched on GPU");
+               fell_back ? "FELL BACK TO CPU" : "dispatched on GPU",
+               r.can_shift ? "ALLOWED" : "refused");
 
         if (!numeric_ok) {
             printf("        numeric: nmse %.3e exceeds 5e-2\n", err);
@@ -216,7 +239,11 @@ int main() {
                    c.expect_gpu ? "GPU" : "CPU fallback");
             printf("        warnings: %s\n", r.warnings.c_str());
         }
-        if (!numeric_ok || !dispatch_ok) {
+        if (!shift_ok) {
+            printf("        shift: allowed on a padded cache; get_can_shift() must refuse or\n");
+            printf("               build_graph_shift corrupts K with unpadded strides\n");
+        }
+        if (!numeric_ok || !dispatch_ok || !shift_ok) {
             failures++;
         }
     }

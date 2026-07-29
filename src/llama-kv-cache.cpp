@@ -1565,6 +1565,15 @@ bool llama_kv_cache::get_can_shift() const {
                         layer.k->type == GGML_TYPE_TURBO4_0)) {
             return false;
         }
+        // Also refuse when the K rows are wider than hparams says, whatever the type. build_graph_shift
+        // derives its view strides from hparams.n_embd_k_gqa(il), so on a padded cache it would walk
+        // the wrong offsets and quietly corrupt K - wrong numbers, no crash. Keyed on the shape rather
+        // than on the type because the two stopped coinciding in ADR-0011: kv_turbo_pads_both() pads a
+        // NON-turbo K when V is turbo, which the turbo-type test above does not catch. Reachable from
+        // `-ctk q8_0 -ctv turbo3` on a head_dim-64 model with context shift enabled.
+        if (layer.k && layer.k->ne[0] != (int64_t) hparams.n_embd_k_gqa(layer.il)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1638,20 +1647,23 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    if (k_is_turbo) {
-        assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
-    } else {
-        assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
-    }
-
     // Must mirror the constructor's padding decision exactly, or this view describes a shape the
     // tensor does not have. Since ADR-0011 a non-turbo K is padded too when V is turbo.
     const uint32_t head_k = hparams.n_embd_head_k(il);
     const ggml_type type_v_l = layers[ikv].v ? layers[ikv].v->type : k->type;
     const bool pad_both = kv_turbo_pads_both(k->type, type_v_l, head_k,
                                              hparams.n_embd_head_v(il), hparams.is_mla());
+
+    // A padded cache is wider than hparams. The `==` case used to be safe for every non-turbo K,
+    // which stopped being true when pad_both started padding one - a debug build would have aborted
+    // here on `-ctk q8_0 -ctv turbo3` at head_dim 64. Release builds never saw it (NDEBUG), which is
+    // why the gates stayed green.
+    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+    if (k_is_turbo || pad_both) {
+        assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
+    } else {
+        assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    }
     const uint32_t head_k_eff = ((k_is_turbo || pad_both) && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
 

@@ -301,6 +301,29 @@ The previous warning was wrong in both directions: it fired on head_dim 256 (whi
 at f16 parity, so it told users to abandon a working config) and stayed silent on head_dim 64 (this
 case). Replaced by a test on the **effective** post-padding dims, which is what the dispatcher sees.
 
+**The fix introduced two defects of its own**, found in an adversarial review run *after* all three
+gates were green — which is the point, since none of them can see either one:
+
+- `get_can_shift()` returned false only when `layer.k->type` was turbo. That was exactly equivalent
+  to the old rule (K was padded only when K was turbo) and stopped being equivalent once pad_both
+  padded a non-turbo K. With `-ctk q8_0 -ctv turbo3` at head_dim 64 and context shift enabled,
+  `build_graph_shift` derives its view strides from the unpadded `hparams.n_embd_k_gqa`, so it walks
+  the wrong offsets and corrupts K silently — no crash. Now keyed on the shape:
+  `layer.k->ne[0] != hparams.n_embd_k_gqa(il)`, whatever the type.
+- an `assert` in get_k claimed `n_embd_k_gqa == hparams.n_embd_k_gqa(il)` on the non-turbo branch,
+  true for every non-turbo K until one started being padded. Every build here is Release, so NDEBUG
+  erased it and no gate could have caught it.
+
+Both share one shape: **a guard written in terms of type, correct only while type and shape
+coincided.** The fix changed the shape without changing the type and both guards silently stopped
+guarding. That is also why Q padding and output trimming in the graph were rewritten to be
+shape-driven — the same latent error was there, just not yet triggered.
+
+The hd64 test now asserts `can_shift == false` on all five padded configs **and** `can_shift == true`
+on the unpadded f16 reference. That second assertion is the one that matters: without it, a guard too
+broad — refusing shift on every cache — would pass all five and would have disabled context shift for
+every user.
+
 Also recorded: the `D=64` rows in `FATTN_VEC_CASES_TURBO_D` are unreachable, because no turbo tensor
 can have 64 columns and the cache always pads first. They are dead code, compiled into every AOT
 build. Left in place deliberately — removing them touches the dispatch table for compile-time gain.

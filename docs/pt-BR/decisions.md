@@ -736,6 +736,43 @@ Duas invariantes sustentam a correcao:
    **forma** (`q->ne[0] < k->ne[0]`, `v->ne[0] != n_embd_head_v`) em vez de por tipo, pelo mesmo
    motivo: um V paddado deixou de ser prova de que V e turbo.
 
+### Dois defeitos que a propria correcao introduziu
+
+Achados numa revisao adversarial **depois** de os tres gates ficarem verdes, o que e o ponto: nenhum
+deles aparece em golden, e2e ou hd64.
+
+**1. `get_can_shift()` deixou de cobrir o caso.** Ela retornava false so quando `layer.k->type` era
+turbo. Isso era exatamente equivalente a regra antiga - o K so era paddado quando o K era turbo -
+e deixou de ser quando o `pad_both` passou a paddar um K **nao-turbo**. Com
+`-ctk q8_0 -ctv turbo3` em head_dim 64 e context shift ligado, `can_shift` virava true e o
+`build_graph_shift` montava a view com
+
+```
+ggml_row_size(layer.k->type, n_embd_head_k)   // nb1
+ggml_row_size(layer.k->type, n_embd_k_gqa)    // nb2
+```
+
+ambos derivados do hparams **sem** padding, sobre um tensor cujas linhas agora tem o dobro da
+largura. O stride errado caminha para celulas erradas: corrompe o cache K em silencio, sem crash.
+
+Corrigido por **forma**, nao por tipo: recusa quando `layer.k->ne[0]` difere de
+`hparams.n_embd_k_gqa(il)`, qualquer que seja o tipo. Cobre qualquer regra de padding futura.
+
+**2. Um `assert` em `get_k` que so falha em build debug.** O ramo nao-turbo afirmava
+`n_embd_k_gqa == hparams.n_embd_k_gqa(il)`, o que era verdade para todo K nao-turbo - ate um deles
+passar a ser paddado. Todos os builds e gates deste projeto sao Release, entao `NDEBUG` transformava
+o assert em nada e nenhum gate podia ver.
+
+O padrao comum aos dois: **uma guarda escrita em termos de tipo, correta enquanto tipo e forma
+coincidiam.** A correcao mudou a forma sem mudar o tipo, e as duas guardas silenciosamente pararam de
+proteger. Foi por isso que o padding do Q e o trim da saida no grafo tambem foram reescritos por
+forma - o mesmo erro estava la, so nao tinha sido acionado ainda.
+
+O teste hd64 agora afirma `can_shift == false` nas cinco configs paddadas **e** `can_shift == true`
+na referencia f16 nao-paddada. A segunda assercao e o controle que importa: sem ela, uma guarda ampla
+demais - que recusasse shift em todo cache - passaria os cinco casos e teria desligado context shift
+para todos os usuarios.
+
 ### Como foi validado
 
 `tests/test-sycl-turbo-hd64.cpp`, novo, com o modelo sintetico. Ele afirma duas coisas diferentes de
