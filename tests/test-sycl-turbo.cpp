@@ -395,7 +395,13 @@ static bool run_wht_roundtrip_test(ggml_backend_t backend, int gs) {
 static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type type_K, ggml_type type_V, const char * name,
                                            void (*quant_ref_K)(const float *, void *, int64_t),
                                            void (*quant_ref_V)(const float *, void *, int64_t), int n_q,
-                                           int n_kv = 256, int D = 128) {
+                                           int n_kv = 256, int D = 128, float logit_softcap = 0.0f) {
+    // logit_softcap != 0 selects the use_logit_softcap kernel instantiation, which applies
+    // softcap * tanh(score) to every KQ score before the mask is added (fattn-vec.hpp). Half of the
+    // compiled vec instances carry that template parameter and, until this parameter existed, none
+    // of them had ever been executed by a test. Gemma-2 and Grok set it in production.
+    // The kernel refuses softcap outside D in {128,256} (fattn-vec.hpp early-out), so do not pass a
+    // non-zero value at any other head dim.
     // head dim. 128 is one QK_TURBO block per row; 256 is two, which is the shape that made a
     // head_dim-256 model lose SYCL flash-attention entirely and fall back to the CPU.
     // The WHT group is fixed at 128 (QK_TURBO3_GROUP), so D=256 is two independent rotations and
@@ -422,7 +428,7 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
     // (ggml.c) - the same value llama-graph.cpp derives. The WHT group is a property of the
     // turbo format, not of head_dim, so D=256 is two independent 128-rotations per row.
     struct ggml_tensor * qr  = ggml_turbo_wht(ctx, q, /*direction=*/0, /*group_size=*/0, /*scale=*/nullptr);
-    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, /*mask=*/nullptr, scale, 0.0f, 0.0f);
+    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, qr, k, v, /*mask=*/nullptr, scale, 0.0f, logit_softcap);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
@@ -482,7 +488,14 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
         for (int j = 0; j < n_kv; j++) {
             float dot = 0.0f;
             for (int d = 0; d < D; d++) dot += qc[d] * k_rows[j][d];
-            scores[j] = dot * scale;
+            // ggml divides the scale by the softcap up front (ggml-cpu/ops.cpp: `scale /=
+            // logit_softcap` before the loop, then `s = s*scale` and `s = logit_softcap*tanhf(s)`),
+            // so the score is softcap*tanh(dot*scale/softcap), not softcap*tanh(dot*scale). Getting
+            // that wrong makes tanh saturate and looks exactly like a kernel defect: cosine stays
+            // near 0.99 while magnitudes diverge several-fold.
+            scores[j] = logit_softcap != 0.0f
+                      ? logit_softcap * tanhf(dot * scale / logit_softcap)
+                      : dot * scale;
         }
         float mx = scores[0];
         for (int j = 1; j < n_kv; j++) mx = std::max(mx, scores[j]);
@@ -988,6 +1001,24 @@ int main() {
     // head_dim-512 model on the SYCL vec path is affected - this is not turbo-specific.
     // Upstream c1063ac9d sidesteps it by pinning 128 threads at D=512. Re-add these two cases when
     // someone takes that on; they fail loudly and immediately.
+
+    // logit_softcap. Half of every compiled vec instance carries use_logit_softcap=true as a template
+    // parameter, and before this block not one of them had ever been executed by a test - the kernel
+    // implements it in 21 places and the golden exercised none. Gemma-2 and Grok set it in production.
+    // Both D=128 and D=256 are covered because fattn-vec.hpp gates softcap on exactly that pair.
+    printf("\n=== FA turbo golden parity, logit_softcap (previously zero coverage) ===\n");
+    {
+        const asym_cfg softcap_cfgs[] = {
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0", quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0",      quantize_row_turbo3_0_ref,  quantize_row_turbo3_0_ref },
+            { GGML_TYPE_F16,      GGML_TYPE_F16,      "f16xf16",       quantize_row_f16_ref_wrap,  quantize_row_f16_ref_wrap },
+        };
+        for (const auto & c : softcap_cfgs) {
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  256, 128, 30.0f);
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 16, 256, 128, 30.0f);
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  256, 256, 30.0f);
+        }
+    }
 
     // Deep context. Every case above runs at n_kv=256, i.e. ntiles_KQ=2, so launch_fattn almost
     // never picks parallel_blocks > 1 and flash_attn_combine_results stays largely unexercised.
