@@ -46,6 +46,10 @@
 /build*
 /release
 /debug
+
+# Synthetic head_dim-64 gguf for test-sycl-turbo-hd64, produced by test-llama-archs.
+# Generated, not a fixture - see the header of tests/test-sycl-turbo-hd64.cpp.
+/synth64/
 /libllama.so
 /llama-*
 /vulkan-shaders-gen

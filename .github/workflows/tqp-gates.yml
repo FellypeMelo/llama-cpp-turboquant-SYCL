@@ -120,8 +120,50 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON ^
             -DGGML_SYCL_DEVICE_ARCH=bmg-g21 -DLLAMA_CURL=OFF
           cmake --build build-ci --config Release -j 8 ^
-            --target llama-cli llama-bench llama-perplexity test-sycl-turbo
+            --target llama-cli llama-bench llama-perplexity test-sycl-turbo test-sycl-turbo-hd64
           if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
+      # test-sycl-turbo-hd64 needs a head_dim-64 model and no such gguf exists to point at, so it
+      # synthesizes one. This second tree is unavoidable: the generator (test-llama-archs) uses llama
+      # internals that are not exported from the shared library, so it only builds with
+      # BUILD_SHARED_LIBS=OFF. It is CPU-only and has no SYCL, so it is cheap next to the AOT build
+      # above. Without this step the hd64 gate would exit 77 on every run - a gate that always skips
+      # is a gate that does not exist, which is the exact defect the rest of this file fixes.
+      - name: Synthesize the head_dim-64 model
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          cmake -G Ninja -B build-gen ^
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl ^
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ^
+            -DGGML_SYCL=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON ^
+            -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build-gen --config Release -j 8 --target test-llama-archs
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          set LLAMA_ARCHS_N_EMBD=128
+          set LLAMA_ARCHS_N_HEAD=2
+          rem save_models() only concatenates dir + "/" + name; it does not create the directory.
+          if not exist synth64 mkdir synth64
+          build-gen\bin\test-llama-archs.exe -a llama -s 42 -o synth64
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+          rem The generator can exit 0 having written nothing, so check the artifact, not the code.
+          if not exist synth64\llama-dense.gguf exit /b 1
+
+      - name: head_dim 64 turbo dispatch
+        # Asserts that turbo KV on a head_dim that is not a multiple of 128 dispatches on the GPU
+        # instead of silently falling back to the CPU backend (ADR-0011). A 77 here means the model
+        # synthesis above produced nothing, which is a failure of this workflow, not a skip.
+        shell: bash
+        run: |
+          set -uo pipefail
+          rc=0
+          TURBO_HD64_MODEL="$PWD/synth64/llama-dense.gguf" \
+            build-ci/bin/test-sycl-turbo-hd64.exe || rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "::error::hd64 SKIPPED - the synthesized model is missing."
+            exit 1
+          fi
+          exit $rc
 
       - name: Golden numeric parity
         # The primary gate. CPU golden vs SYCL kernel in the rotated domain.
