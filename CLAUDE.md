@@ -202,6 +202,17 @@ perplexity gate): turbo on **V** costs ~0.4%; turbo on **K** costs ~30%. PPL vs 
 symmetric turbo2/turbo3**; `-ctk q8_0 -ctv turboN` is the config. Note the golden tests are structurally
 blind to this (they quantize both sides identically, so quant error cancels) - only perplexity sees it.
 
+**head_dim MUST be 64 or 128.** `FATTN_VEC_CASES_TURBO_D` covers only those, and there is no abort when
+it does not match: `ggml_sycl_flash_attn_ext_supported` is just `get_best_fattn_kernel != NONE`, so ggml
+schedules the whole flash-attention node on the **CPU backend** instead. The KV cache stays on the GPU in
+turbo format; what moves is the operation, so every step pays a GPU->CPU copy, CPU attention, and a copy
+back. Correct output, no log line, ~10x slower prefill. Measured on a head_dim-256 model (B580, pp2048):
+`q8_0 x turbo3` 139 t/s vs 1401 for `q8_0 x q8_0` and 1427 for `f16 x f16`. A warning now fires at cache
+construction. **None of the three gates can see this** - golden compares values (CPU computes correct
+values), e2e compares text (text is coherent), PPL compares quality (quality is unchanged). Before
+blaming turbo for slowness on a new model, check `n_embd_head_k` first. D=256 was attempted and reverted;
+the blocker is shared local memory, not registers - see ADR-0008.
+
 Accepted `--cache-type-k` / `-v`: `turbo2`, `turbo3`, `turbo4` (not `turbo2_0`). **Requires `--flash-attn on`**
 (bare `--flash-attn` without a value now errors upstream). Only the turbo build parses these type strings. On
 Intel GPUs set `SYCL_CACHE_PERSISTENT=1` once so the JIT caches kernels to disk (first launch compiles all

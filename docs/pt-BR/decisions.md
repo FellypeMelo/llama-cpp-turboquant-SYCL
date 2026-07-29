@@ -426,3 +426,76 @@ pediu, sem aviso. Nao corrigido aqui (mexe em politica de modo adaptativo, fora 
 
 Isso tambem explica por que a tabela de memoria do deep-dive lista turbo2 em 816 MiB por lado e nao
 612: aquele numero ja embute as 4 camadas q8_0 do modo 8 (4x68 + 32x17 = 816).
+
+---
+
+## ADR-0008 - head_dim fora de {64,128}: o fallback silencioso para CPU
+
+**Data:** 2026-07-29
+**Status:** Aceito (aviso aplicado; suporte a D=256 tentado e revertido)
+
+### O mecanismo, que e o ponto principal
+`ggml_sycl_flash_attn_ext_supported` e literalmente
+`ggml_sycl_get_best_fattn_kernel(...) != BEST_FATTN_KERNEL_NONE`. Quando o router devolve NONE, o
+ggml **nao aborta e nao avisa**: ele agenda aquele no do grafo no backend CPU. O KV cache continua
+na GPU em formato turbo; o que muda de lugar e a operacao de atencao, entao passa-se a pagar copia
+GPU->CPU, atencao em CPU e copia de volta, a cada passo.
+
+Resultado correto, sem uma linha de log, e roughly 10x mais lento. Essa e a pior classe de bug do
+subsistema: nao quebra nada que qualquer gate consiga ver.
+
+### Cobertura real de head_dim
+`FATTN_VEC_CASES_TURBO_D` cobre D em {64,128}. Qualquer outro head_dim com turbo cai no caminho
+acima. O `q8_0`/`f16` cobrem ate 512 via `FATTN_VEC_CASES_ALL_D`, entao a assimetria e so do turbo.
+
+### Evidencia (Arc B580, llama-bench pp2048, modelo qwen35 9B Q4_K_M, head_dim 256)
+| config | pp2048 | tg32 |
+|--------|-------:|-----:|
+| q8_0 x turbo3 |  139,37 | 40,67 |
+| q8_0 x q8_0   | 1401,26 | 44,93 |
+| f16 x f16     | 1426,91 | 41,61 |
+
+O turbo fica em **10,2x mais lento** no prefill. O decode quase nao muda porque e limitado por banda
+de pesos e a atencao pesa pouco ali.
+
+### Tentativa de habilitar D=256, e por que foi revertida
+Feita e desfeita em 2026-07-29. Tres camadas de bloqueio, nesta ordem:
+
+1. **Link.** Adicionar `FATTN_VEC_CASE(256, ...)` quebra com LNK2019 nos 4 combos extern-declarados
+   (`(F16,TURBO3_0)`, `(Q8_0,TURBO3_0)`, `(TURBO3_0,Q8_0)`, `(TURBO3_0,TURBO3_0)`), porque
+   `EXTERN_DECL_FATTN_VEC_CASES` e invocada em D=256 e suprime a instanciacao implicita. Os pares com
+   TURBO4_0 no K linkam sozinhos - nao estao na grade extern. Confirma o ADR-0004 na pratica.
+2. **JIT.** Com os arquivos de instancia corrigidos o link passa e o **kernel nao compila no device**,
+   derrubando o programa inteiro: D=128 para de funcionar junto. O comentario do macro culpava
+   pressao de registrador por `nthreads_KQ=1`, o que **esta desatualizado** - o SYCL usa
+   `128/cpy_nb` desde a cooperative-register rework. O teto real e **memoria local compartilhada**:
+   `ne_combine = nwarps * V_cols_per_iter * D` da 8*8*256 = 16384 floats = **64 KB** em D=256, que e
+   o limite por work-group no Xe2. Em D=128 sao 32 KB e cabe.
+3. **Correcao.** Baixar `nthreads_V` resolve o orcamento de SLM (16 KB) mas quebra o resultado:
+   golden com cosine **-0,34** e rel-MSE 1480. O dequant do V turbo assume que cada lane cobre um
+   bloco de 128 inteiro, premissa que cai quando `V_cols_per_iter` diminui.
+
+`nthreads_V` esta preso dos dois lados. D=256 exige trabalho de kernel, nao ajuste de constante.
+
+### O caminho viavel
+O **f16 TILE lida com D=256 corretamente** - o shim de prefill mediu rel-MSE 3,5e-4 nesses casos
+antes da falha de JIT. Rotear turbo com D>128 para o TILE em vez do VEC evita o kernel VEC por
+completo: sem SLM, sem premissa escondida, sem risco de GRF. Custo: o TILE e orientado a lote e
+decode de 1 coluna nele e ineficiente - mas o baseline atual e atencao em CPU, que perde para quase
+qualquer coisa na GPU. E a mesma estrutura que o CUDA documenta para o proprio teto do vec
+(`ggml-cuda/fattn.cu`: "head_dim > 256 cannot use VEC (falls through to TILE)").
+
+### Ponto cego dos gates
+**Nenhum dos tres gates detecta o fallback para CPU.** O golden compara valores e a CPU produz os
+valores certos; o e2e compara texto e o texto sai coerente; a perplexidade compara qualidade e a
+qualidade nao muda. Todos passam com a atencao rodando em CPU. Um teste que afirme **onde** a
+operacao rodou vale mais, aqui, do que mais um teste que afirme o que ela calculou.
+
+### Licao de metodo
+Tres interpretacoes foram feitas antes de medir neste dia, e as tres cairam na primeira medicao:
+- "o modelo e 75% SSM, entao o KV nao e o gargalo" -> f16 faz 1427 t/s no mesmo modelo;
+- "o fix assimetrico esta ativo e mensuravel neste workload" -> o turbo nem roda em head_dim 256;
+- "o bloqueio de D=256 e pressao de registrador" (comentario no codigo) -> e SLM.
+
+Medir custa minutos. Interpretar estrutura custou dois ciclos de build e uma conclusao publicada
+errada.
