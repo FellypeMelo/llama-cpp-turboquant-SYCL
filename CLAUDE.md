@@ -202,16 +202,23 @@ perplexity gate): turbo on **V** costs ~0.4%; turbo on **K** costs ~30%. PPL vs 
 symmetric turbo2/turbo3**; `-ctk q8_0 -ctv turboN` is the config. Note the golden tests are structurally
 blind to this (they quantize both sides identically, so quant error cancels) - only perplexity sees it.
 
-**head_dim MUST be 64 or 128.** `FATTN_VEC_CASES_TURBO_D` covers only those, and there is no abort when
-it does not match: `ggml_sycl_flash_attn_ext_supported` is just `get_best_fattn_kernel != NONE`, so ggml
-schedules the whole flash-attention node on the **CPU backend** instead. The KV cache stays on the GPU in
-turbo format; what moves is the operation, so every step pays a GPU->CPU copy, CPU attention, and a copy
-back. Correct output, no log line, ~10x slower prefill. Measured on a head_dim-256 model (B580, pp2048):
-`q8_0 x turbo3` 139 t/s vs 1401 for `q8_0 x q8_0` and 1427 for `f16 x f16`. A warning now fires at cache
-construction. **None of the three gates can see this** - golden compares values (CPU computes correct
-values), e2e compares text (text is coherent), PPL compares quality (quality is unchanged). Before
-blaming turbo for slowness on a new model, check `n_embd_head_k` first. D=256 was attempted and reverted;
-the blocker is shared local memory, not registers - see ADR-0008.
+**head_dim must be 64, 128 or 256** - that is what `FATTN_VEC_CASES_TURBO_D` covers. **512 is broken**,
+and not only for turbo: `f16 x f16` and `q8_0 x q8_0` measure cosine 0.039 and 0.047 there, a third
+D=512-specific cause is still unfound, and the reproduction sits in a comment in
+`tests/test-sycl-turbo.cpp`.
+
+Outside the covered set there is no abort: `ggml_sycl_flash_attn_ext_supported` is just
+`get_best_fattn_kernel != NONE`, so ggml schedules the whole flash-attention node on the **CPU backend**
+instead. The KV cache stays on the GPU in turbo format; what moves is the operation, so every step pays a
+GPU->CPU copy, CPU attention, and a copy back. Correct output, no log line, ~10x slower prefill.
+**None of the three gates can see this** - golden compares values (the CPU computes correct values), e2e
+compares text (text is coherent), PPL compares quality (quality is unchanged). A warning fires at cache
+construction, and before blaming turbo for slowness on a new model, check `n_embd_head_k` first.
+
+D=256 took four separate fixes (LNK2019 on extern-declared combos, 128 KB of shared memory in the
+combine, a host/device `nthreads` disagreement, and f16 TILE precision for turbo K). The macro comment
+that blamed register pressure was wrong on all four counts - see ADR-0009. Measured after: `q8_0 x turbo3`
+went 139 -> 1475 t/s at pp2048 on a head_dim-256 model, f16 parity.
 
 Accepted `--cache-type-k` / `-v`: `turbo2`, `turbo3`, `turbo4` (not `turbo2_0`). **Requires `--flash-attn on`**
 (bare `--flash-attn` without a value now errors upstream). Only the turbo build parses these type strings. On

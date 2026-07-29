@@ -432,7 +432,9 @@ Isso tambem explica por que a tabela de memoria do deep-dive lista turbo2 em 816
 ## ADR-0008 - head_dim fora de {64,128}: o fallback silencioso para CPU
 
 **Data:** 2026-07-29
-**Status:** Aceito (aviso aplicado; suporte a D=256 tentado e revertido)
+**Status:** Aceito, mas **parcialmente superado pelo ADR-0009** - D=256 passou a ser suportado.
+O mecanismo do fallback silencioso descrito aqui continua valendo para head_dim fora de
+{64,128,256}, e D=512 continua quebrado.
 
 ### O mecanismo, que e o ponto principal
 `ggml_sycl_flash_attn_ext_supported` e literalmente
@@ -444,7 +446,10 @@ GPU->CPU, atencao em CPU e copia de volta, a cada passo.
 Resultado correto, sem uma linha de log, e roughly 10x mais lento. Essa e a pior classe de bug do
 subsistema: nao quebra nada que qualquer gate consiga ver.
 
-### Cobertura real de head_dim
+### Cobertura real de head_dim (atualizado pelo ADR-0009)
+> Quando este ADR foi escrito, `FATTN_VEC_CASES_TURBO_D` cobria {64,128}. O ADR-0009 acrescentou
+> 256. O paragrafo abaixo fica como registro do estado da epoca; leia o ADR-0009 para o atual.
+
 `FATTN_VEC_CASES_TURBO_D` cobre D em {64,128}. Qualquer outro head_dim com turbo cai no caminho
 acima. O `q8_0`/`f16` cobrem ate 512 via `FATTN_VEC_CASES_ALL_D`, entao a assimetria e so do turbo.
 
