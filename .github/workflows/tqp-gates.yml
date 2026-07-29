@@ -89,7 +89,12 @@ jobs:
         run: |
           set -uo pipefail
           for s in scripts/turbo-quality-gate.sh tests/test-e2e-turbo-kv.sh; do
-            bash "$s" >/tmp/out 2>&1; rc=$?
+            # GitHub runs this step as `bash -e`, and `set -uo pipefail` above does not clear -e.
+            # Written as `bash "$s"; rc=$?` the expected exit 77 would kill the step before rc was
+            # ever read, so the only always-on job in this workflow would be permanently red.
+            # `|| rc=$?` puts the call in a condition context, where -e does not fire.
+            rc=0
+            bash "$s" >/tmp/out 2>&1 || rc=$?
             if [ "$rc" -ne 77 ]; then
               echo "$s exited $rc, expected 77 (SKIP) with no model/binaries present:"
               tail -20 /tmp/out
@@ -133,9 +138,14 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          # LLAMA_CLI must be set: the build above writes to build-ci, but the script only searches
+          # build-perf, build and build-sync, so without this the gate would either test a stale
+          # binary left over from a previous run or skip with 77 and be reported as a missing model.
+          # `|| rc=$?` because this step runs under `bash -e` and the 77 check below must be reached.
+          rc=0
+          LLAMA_CLI="$PWD/build-ci/bin/llama-cli.exe" \
           TURBO_E2E_MODEL="${TURBO_E2E_MODEL:-G:/models/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf}" \
-            bash tests/test-e2e-turbo-kv.sh
-          rc=$?
+            bash tests/test-e2e-turbo-kv.sh || rc=$?
           if [ "$rc" -eq 77 ]; then
             echo "::error::e2e SKIPPED - the reference model is missing on this runner."
             exit 1
@@ -153,6 +163,23 @@ jobs:
     needs: [gpu-gates]
     steps:
       - uses: actions/checkout@v6
+
+      # This job cannot inherit gpu-gates' build tree. `needs:` orders the jobs but shares no
+      # filesystem contract, and actions/checkout above cleans untracked files from the workspace,
+      # which is exactly what build-ci is. Pointing LLAMA at a build-ci that checkout just deleted
+      # made the gate skip on a missing binary every single run.
+      - name: Build (AOT bmg_g21)
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          cmake -G Ninja -B build-ci ^
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_BUILD_TYPE=Release -DGGML_SYCL=ON ^
+            -DGGML_SYCL_DEVICE_ARCH=bmg-g21 -DLLAMA_CURL=OFF
+          cmake --build build-ci --config Release -j 8 ^
+            --target llama-bench llama-perplexity
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+
       - name: Quality + speed gate
         shell: bash
         run: |

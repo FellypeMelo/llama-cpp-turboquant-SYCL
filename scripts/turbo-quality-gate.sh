@@ -37,6 +37,21 @@ if [ -z "$PPL_BIN" ]; then
     exit 77
 fi
 
+# llama-bench drives test 2. Resolved here rather than at the point of use so that a missing
+# binary skips (77) like every other missing dependency. Discovered late it produced no timing
+# line, which test 2 could only read as "crash or timeout" -> exit 1, i.e. a missing tool
+# reported as a quality regression, contradicting the exit contract documented at the top.
+BENCH_BIN=""
+for cand in "$LLAMA/llama-bench" "$LLAMA/llama-bench.exe"; do
+    if [ -x "$cand" ]; then BENCH_BIN=$cand; break; fi
+done
+if [ -z "$BENCH_BIN" ]; then
+    echo "SKIP: llama-bench not found under $LLAMA (needed for the speed half of this gate)"
+    echo "      build it with:"
+    echo "      cmake --build build-perf --config Release -j 8 --target llama-bench"
+    exit 77
+fi
+
 # --- resolve model: reference is Qwen3-4B Q4_K_M (head_dim 128, GQA 4:1) ---
 if [ -z "${MODEL:-}" ]; then
     for cand in \
@@ -73,13 +88,7 @@ run_ppl() {
 # llama-perplexity reports "N seconds per pass" and never prints a tokens-per-second line, so the
 # old grep for "prompt eval ... tokens per second" could not match anything and the speed half of
 # this gate always reported a crash. llama-bench is the right instrument and prints a t/s column.
-BENCH_BIN=""
-for cand in "$LLAMA/llama-bench" "$LLAMA/llama-bench.exe"; do
-    if [ -x "$cand" ]; then BENCH_BIN=$cand; break; fi
-done
-
 run_tps() {
-    if [ -z "$BENCH_BIN" ]; then return 0; fi
     "$BENCH_BIN" -m "$MODEL" -ngl 99 -fa 1 -ctk "$1" -ctv "$2" -p 4096 -n 0 -r 2 2>/dev/null |
         awk -F'|' '/pp4096/ { if (match($(NF-1), /[0-9]+\.[0-9]+/)) print substr($(NF-1), RSTART, RLENGTH) }'
 }

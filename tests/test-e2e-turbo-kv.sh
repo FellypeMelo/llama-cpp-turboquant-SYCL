@@ -53,7 +53,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # --- locate llama-cli ---------------------------------------------------------
 find_cli() {
     if [ -n "${LLAMA_CLI:-}" ] && [ -x "${LLAMA_CLI}" ]; then echo "$LLAMA_CLI"; return; fi
-    for d in build-perf build build-sync; do
+    for d in build-perf build build-sync build-ci; do
         for e in llama-cli.exe llama-cli; do
             if [ -x "$ROOT/$d/bin/$e" ]; then echo "$ROOT/$d/bin/$e"; return; fi
         done
