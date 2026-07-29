@@ -707,18 +707,52 @@ A cadeia, tres arquivos:
 Turbo simetrico no mesmo modelo funciona: os dois lados sao paddados para 128, o Q tambem (o gate do
 passo 2 acerta), e o kernel D=128 roda normal.
 
-### Por que so foi avisado, e nao corrigido
+### Corrigido: os dois lados sao paddados juntos
 
-O consertar de verdade e paddar os dois lados quando qualquer um for turbo. Isso exige que a regiao
-de padding de um K nao-turbo seja **provadamente zerada** no caminho de escrita do cache (senao o
-produto interno soma lixo) e que o Q seja paddado junto. Nao ha modelo head_dim 64 na maquina de
-validacao, e a regra do projeto e nao mudar numerica sem medir em silicio. Um padding errado aqui
-nao aborta: ele produz numeros silenciosamente errados, que e a pior classe de defeito possivel
-neste codigo.
+A primeira versao desta ADR parava no diagnostico, com a justificativa de que nao havia modelo
+head_dim 64 na maquina e a regra do projeto proibe mudar numerica sem medir em silicio. A
+justificativa caiu quando ficou claro que o **modelo podia ser fabricado**: `tests/test-llama-archs`
+constroi GGUFs sinteticos via `llama_model_saver`, e com `LLAMA_ARCHS_N_EMBD=128
+LLAMA_ARCHS_N_HEAD=2` sai um `llama` de head_dim 64. Ele tem pesos aleatorios e `no_vocab`, o que
+nao atrapalha: o teste alimenta token ids crus e compara logits, nunca tokeniza.
 
-Entao a mudanca desta ADR e **so diagnostico**: o aviso em `llama_kv_cache` agora calcula os dois
-head_dims efetivos (aplicando o padding que ele mesmo vai aplicar logo abaixo) e avisa quando eles
-divergem, dizendo o que fazer - usar a mesma familia dos dois lados.
+A regra passou a ser: **se qualquer lado do par KV for turbo, os dois sao paddados** ate o mesmo
+multiplo de 128 (`kv_turbo_pads_both()`). Fica restrita a modelos cujos head_dims de K e V ja
+coincidem - MLA carrega 576 contra 512 por construcao e tem `case 576` proprio no dispatcher, e
+paddar nao conserta nada la (o teto do turbo e 256 de qualquer forma).
+
+**A mudanca e no-op para todo modelo que hoje funciona.** O gatilho e `hd % 128 != 0`, entao
+head_dim 128 e 256 nao sao tocados.
+
+Duas invariantes sustentam a correcao:
+
+1. `ggml_pad` preenche com **zero**, e e por ele que `cpy_k`/`cpy_v` alargam a linha. Entao as
+   lanes de padding do Q sao zero e o produto interno sobre elas e zero **independentemente** do
+   que o cache guarde ali - a correcao nao depende de o buffer estar zerado (embora esteja:
+   `ggml_backend_buffer_clear(buf, 0)`).
+2. A regra vive em **um** lugar. Ela precisa valer identica no construtor, em `get_k`/`get_v` e em
+   `cpy_k`/`cpy_v`; estar espalhada em cinco copias e a razao de o padding ter divergido do que o
+   dispatcher esperava. No grafo o padding do Q e o trim da saida passaram a ser dirigidos por
+   **forma** (`q->ne[0] < k->ne[0]`, `v->ne[0] != n_embd_head_v`) em vez de por tipo, pelo mesmo
+   motivo: um V paddado deixou de ser prova de que V e turbo.
+
+### Como foi validado
+
+`tests/test-sycl-turbo-hd64.cpp`, novo, com o modelo sintetico. Ele afirma duas coisas diferentes de
+proposito, porque nenhuma sozinha bastaria:
+
+- **o aviso de fallback nao dispara** - ou seja, o dispatcher aceitou o par. Nenhuma checagem
+  numerica enxerga isso: a CPU calcula valores corretos, e medido, o `nmse` contra f16 e ~1e-7
+  **antes** da correcao, com a atencao inteira na CPU.
+- **os logits continuam batendo com f16** - guarda contra o padding corromper o que deveria deixar
+  intacto.
+
+Antes: 4 das 5 configs falhavam com `FELL BACK TO CPU`. Depois: 5/5 na GPU.
+
+E como o aviso e construto meu, a confirmacao veio de um instrumento independente,
+`GGML_SCHED_DEBUG=2`, que imprime o backend de cada no: **288 nos `FLASH_ATTN`, todos em `SYCL0`,
+nenhum na CPU**, e o log passou a mostrar `turbo zero-padding K head_dim 64 -> 128` tambem quando o
+K e `q8_0` - que e exatamente o que a correcao faz.
 
 ### O aviso antigo estava errado nas duas pontas
 

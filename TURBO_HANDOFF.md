@@ -56,10 +56,11 @@ quantization error cancels. Only perplexity sees it.
 - **KV memory @64k vs fp16:** turbo2 5.6x, turbo3 5.1x, turbo4 3.8x (q8_0 only 1.9x).
 
 ### Known limitations — read before diagnosing anything
-1. **head_dim 64 + asymmetric KV silently runs attention on the CPU** (ADR-0011). `-ctk q8_0 -ctv
-   turbo3` on a head_dim-64 model pads V to 128 and leaves K at 64; the dispatcher refuses the pair.
-   Correct output, ~10x slower. A warning now fires at cache construction. Symmetric turbo works on
-   those models.
+1. ~~head_dim 64 + asymmetric KV silently runs attention on the CPU~~ — **fixed** (ADR-0011). When
+   either side of the KV pair is turbo, both sides are now padded to the same multiple of 128, so
+   `-ctk q8_0 -ctv turbo3` dispatches on the GPU at head_dim 64. No-op for head_dim 128 and 256.
+   Covered by `tests/test-sycl-turbo-hd64.cpp`, which needs a synthetic model (`TURBO_HD64_MODEL`,
+   exit 77 without it) — see that file's header for the two commands that regenerate it.
 2. **Any uncovered head_dim does the same thing** (ADR-0008). `ggml_sycl_flash_attn_ext_supported` is
    just `get_best_fattn_kernel != NONE`, and ggml responds to false by scheduling the op on the CPU
    backend — not by aborting. **No gate can detect this**: golden compares values (CPU values are

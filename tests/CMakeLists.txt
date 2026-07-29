@@ -222,6 +222,16 @@ if (GGML_SYCL)
     target_link_libraries(test-sycl-stress-deep PRIVATE llama-common ggml-sycl)
     add_test(NAME test-sycl-stress-deep COMMAND test-sycl-stress-deep)
 
+    # Turbo KV on a head_dim that is not a multiple of 128, where only the turbo side of the cache
+    # used to be padded and the K/V head_dims ended up disagreeing - which the SYCL dispatcher
+    # refuses, silently moving attention to the CPU backend. Deliberately NOT in SYCL_TEST_TARGETS:
+    # it uses the public llama API only and must not be compiled with -fsycl. Needs a synthetic
+    # head_dim-64 model (TURBO_HD64_MODEL); exits 77 (SKIP) without one. See the file header.
+    add_executable(test-sycl-turbo-hd64 test-sycl-turbo-hd64.cpp)
+    target_link_libraries(test-sycl-turbo-hd64 PRIVATE llama)
+    add_test(NAME test-sycl-turbo-hd64 COMMAND test-sycl-turbo-hd64)
+    set_tests_properties(test-sycl-turbo-hd64 PROPERTIES LABELS "gpu;turbo" SKIP_RETURN_CODE 77)
+
     foreach(sycl_test_target ${SYCL_TEST_TARGETS})
         target_compile_options(${sycl_test_target} PRIVATE "-fsycl")
         target_link_options(${sycl_test_target} PRIVATE "-fsycl")

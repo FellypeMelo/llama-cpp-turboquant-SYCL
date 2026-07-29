@@ -113,6 +113,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 10240;
     }
 
+    // Fork-local: lets --out synthesize a model with an arbitrary head_dim. The turbo KV path in
+    // this fork behaves differently when head_dim is not a multiple of 128 (the cache pads turbo
+    // rows up to QK_TURBO=128), and head_dim 64 is the case that matters. No model with that shape
+    // was available to test against, and every arch here yields 128 or more. Read only when saving.
+    if (const char * e = getenv("LLAMA_ARCHS_N_EMBD")) { n_embd = (uint32_t) atoi(e); }
+    if (const char * e = getenv("LLAMA_ARCHS_N_HEAD")) { n_head = (uint32_t) atoi(e); }
+
     const uint32_t n_embd_head = n_embd / n_head;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));

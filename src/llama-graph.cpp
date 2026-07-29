@@ -380,7 +380,7 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
     };
 
     LLAMA_LOG_DEBUG("%s: n_swa : %d, n_kv: %d, swa_type: %s\n", __func__, (int)n_swa, (int)n_kv, swa_type_str);
-    LLAMA_LOG_DEBUG("%s: '0' = can attend, '∞' = masked\n", __func__);
+    LLAMA_LOG_DEBUG("%s: '0' = can attend, 'inf' = masked\n", __func__);
     LLAMA_LOG_DEBUG("%s: Rows = query tokens, Columns = key/value tokens\n\n", __func__);
 
     LLAMA_LOG_DEBUG("    ");
@@ -394,7 +394,7 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
         for (int j = 0; j < std::min((int64_t)20, n_kv); ++j) {
             float val = llama_cast<float>(data[i * n_kv + j]);
             if (val == -INFINITY) {
-                LLAMA_LOG_DEBUG(" ∞");
+                LLAMA_LOG_DEBUG(" inf");
             } else {
                 LLAMA_LOG_DEBUG(" 0");
             }
@@ -2692,15 +2692,18 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
-    // Q shape: (n_embd_head, n_head, n_tokens)
-    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    // TurboQuant: Q has to match the cache's head_dim, which llama_kv_cache pads up to a multiple
+    // of 128 whenever either side of the KV pair is turbo - a turbo row cannot be narrower than
+    // QK_TURBO. Driven off the shapes rather than off k->type on purpose: the padding rule lives in
+    // the cache, and duplicating it here is exactly how Q and K drifted apart before (ADR-0011).
+    // ggml_pad writes zeros, so the padded lanes contribute nothing to Q.K^T whatever the cache
+    // holds there.
+    if (q->ne[0] < k->ne[0]) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
+    // The rotation stays gated on K being turbo: only a turbo K stores WHT-rotated values, so only
+    // then must Q be rotated into the same domain.
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
         ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
@@ -2709,10 +2712,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant: if V was padded, the output has padded dimensions.
-    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
-    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    // TurboQuant: if V was padded, the output has padded dimensions - trim them off.
+    // Keyed on the shape, not on v->type: since ADR-0011 the cache pads BOTH sides when either is
+    // turbo, so a padded V is no longer proof that V itself is turbo. A v->type gate here would
+    // leave the padded lanes in the output whenever K is the turbo side.
+    if (v->ne[0] != (int64_t) hparams.n_embd_head_v(il)) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = v->ne[0];
@@ -2721,7 +2725,7 @@ ggml_tensor * llm_graph_context::build_attn(
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
             // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
             // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
-            // Qwen2.5-0.5B head_dim=64 padded → 128) don't fail the element
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
             // count check in ggml_reshape_3d.
             const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
@@ -2822,14 +2826,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    // TurboQuant: pre-rotate Q for K-only (MLA) attention
-    // For zero-padded models, pad Q to match padded K dim first.
+    // TurboQuant, K-only (MLA) attention. Shape-driven for the same reason as above.
+    if (q->ne[0] < k->ne[0]) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
         ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
@@ -2848,7 +2849,7 @@ ggml_tensor * llm_graph_context::build_attn(
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
             // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
             // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
-            // Qwen2.5-0.5B head_dim=64 padded → 128) don't fail the element
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
             // count check in ggml_reshape_3d.
             const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];
@@ -3021,12 +3022,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
+    // TurboQuant, iSWA attention. Shape-driven for the same reason as above.
+    if (q->ne[0] < k->ne[0]) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
-            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
-        }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
         ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
@@ -3035,16 +3035,16 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
-    // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    // TurboQuant: if V was padded, trim the padded lanes off the output. Keyed on the shape rather
+    // than v->type - see the equivalent site in build_attn for why.
+    if (v->ne[0] != (int64_t) hparams.n_embd_head_v(il)) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),
             // not (n_embd_head * n_head_kv, n_tokens). Reshape needs n_head
             // (Q-head count) so GQA models with n_head != n_head_kv (e.g.
-            // Qwen2.5-0.5B head_dim=64 padded → 128) don't fail the element
+            // Qwen2.5-0.5B head_dim=64 padded -> 128) don't fail the element
             // count check in ggml_reshape_3d.
             const int64_t n_head_v = hparams.n_head(il);
             const int64_t n_tokens_cur = cur->ne[1];

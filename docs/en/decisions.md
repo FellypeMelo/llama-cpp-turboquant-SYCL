@@ -270,19 +270,32 @@ original failure.
 
 ## ADR-0011 — non-128-multiple head_dim with asymmetric KV: the second silent fallback
 
-**Status:** Accepted as a diagnostic. The behaviour is a known limitation, not a fixed bug.
+**Status:** Accepted, fixed and validated on Arc B580.
 
 With the **recommended** config `-ctk q8_0 -ctv turbo3` on any model whose head_dim is not a multiple
-of 128 (head_dim 64 is the common case), the whole attention op runs on the CPU. The cache pads only
+of 128 (head_dim 64 is the common case), the whole attention op ran on the CPU. The cache padded only
 the turbo side to a multiple of 128 (mandatory: `QK_TURBO = 128`, so a 64-wide turbo row cannot
-exist), and `llama-graph` pads Q only when **K** is turbo. So K stays 64, V becomes 128, and the
-dispatcher refuses `V->ne[0] != K->ne[0]`. Symmetric turbo on the same model works — both sides and Q
-are padded.
+exist), and `llama-graph` padded Q only when **K** was turbo. So K stayed 64, V became 128, and the
+dispatcher refused `V->ne[0] != K->ne[0]` — which does not abort, it moves attention to the CPU.
 
-Fixing it properly means padding both sides whenever either is turbo, which requires the padding
-region of a non-turbo K to be provably zeroed in the cache-write path. There is no head_dim-64 model
-on the validation machine, and a wrong padding here does not abort — it produces silently wrong
-numbers. So this ADR ships **diagnostics only**.
+**Fix:** when either side of the pair is turbo, both sides are padded to the same width
+(`kv_turbo_pads_both()`), restricted to models whose K and V head_dims already agree so MLA is
+untouched. The trigger is `hd % 128 != 0`, so this is a **no-op for every model that works today** —
+128 and 256 are not touched. Two invariants carry it: `ggml_pad` fills with zeros and is what widens
+the rows, so Q's padded lanes contribute nothing to Q.K^T regardless of cache contents; and the rule
+now lives in one function, because having it copied across the constructor, `get_k`/`get_v` and
+`cpy_k`/`cpy_v` is how it drifted. In the graph, Q padding and output trimming became shape-driven
+rather than type-driven — a padded V is no longer proof that V is the turbo side.
+
+**Validation** needed a head_dim-64 model, and none existed. It was synthesized: `test-llama-archs`
+builds gguf files with arbitrary hparams via `llama_model_saver`, and `LLAMA_ARCHS_N_EMBD=128
+LLAMA_ARCHS_N_HEAD=2` yields head_dim 64. `tests/test-sycl-turbo-hd64.cpp` asserts two separate
+things, because neither suffices alone: that the fallback warning does not fire (the dispatcher
+accepted the pair — no numeric check can see this, the CPU path measured nmse ~1e-7 against f16
+*while broken*), and that logits still match f16 (guard against the padding corrupting values).
+Before: 4 of 5 configs fell back to the CPU. After: 5/5 on the GPU. Confirmed independently of that
+warning with `GGML_SCHED_DEBUG=2`, which prints each node's backend: 288 `FLASH_ATTN` nodes, all on
+`SYCL0`, none on the CPU.
 
 The previous warning was wrong in both directions: it fired on head_dim 256 (which ADR-0009 made work
 at f16 parity, so it told users to abandon a working config) and stayed silent on head_dim 64 (this

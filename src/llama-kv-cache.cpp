@@ -17,6 +17,36 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static inline bool kv_is_turbo_type(ggml_type t) {
+    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+}
+
+// The turbo head_dim padding rule, in one place because it has to hold identically in the cache
+// constructor, in get_k/get_v and in cpy_k/cpy_v - and previously did not.
+//
+// A turbo row cannot be narrower than QK_TURBO (128), so a turbo side of a head_dim-64 cache must
+// be padded up. Padding ONLY the turbo side is what broke: K and V then carried different
+// head_dims, ggml_sycl_get_best_fattn_kernel refuses such a pair, and refusing does not abort - it
+// moves the whole attention op to the CPU backend, silently and about 10x slower (ADR-0011). So
+// when either side is turbo, both sides get padded to the same width.
+//
+// Restricted to models whose K and V head_dims already agree. MLA carries 576 against 512 by
+// design and has its own dispatch case; padding it would change the layout of a path that padding
+// does not fix (turbo is capped at head_dim 256 either way).
+//
+// Returns false for every head_dim that is already a multiple of 128, so this is a no-op for every
+// model that works today - 128 and 256 are untouched.
+static inline bool kv_turbo_pads_both(ggml_type type_k, ggml_type type_v,
+                                      uint32_t hd_k, uint32_t hd_v, bool is_mla) {
+    if (is_mla || hd_k != hd_v) {
+        return false;
+    }
+    if (!kv_is_turbo_type(type_k) && !kv_is_turbo_type(type_v)) {
+        return false;
+    }
+    return hd_k % 128 != 0;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -229,6 +259,7 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     // Fires the turbo CPU-fallback warning once per cache, on the first layer this cache actually
+    // -- see kv_turbo_pads_both() in this file for the padding rule these warnings describe.
     // owns. Gating on `il == 0` instead looks equivalent and is not: layer 0 is skipped by the
     // `has_kv` and `filter` guards below, so on an iSWA model (two caches, one per attention type)
     // or a hybrid with non-attention layers, the cache that does not own layer 0 stays silent no
@@ -414,19 +445,23 @@ llama_kv_cache::llama_kv_cache(
         //   (a) the padded head_dim has no turbo instance (FATTN_VEC_CASES_TURBO_D emits 128 and
         //       256; 64 is emitted but unreachable because the cache pads every turbo row up to a
         //       multiple of QK_TURBO=128 before the kernel ever sees it),
-        //   (b) K and V end up with different head_dims because only one side is turbo and only
-        //       turbo sides get padded, which ggml_sycl_get_best_fattn_kernel rejects outright
-        //       (fattn.cpp, "V->ne[0] != K->ne[0]").
+        //   (b) K and V end up with different head_dims. Since ADR-0011 kv_turbo_pads_both() pads
+        //       both sides together, so this is now reachable only where that rule declines to
+        //       apply - a model whose K and V head_dims differ in hparams to begin with.
+        const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 ||
+                                 layer_type_v == GGML_TYPE_TURBO4_0 ||
+                                 layer_type_v == GGML_TYPE_TURBO2_0);
+        const bool pad_both = kv_turbo_pads_both(layer_type_k, layer_type_v,
+                                                 hparams.n_embd_head_k(il), hparams.n_embd_head_v(il),
+                                                 is_mla);
         {
-            const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 ||
-                                     layer_type_v == GGML_TYPE_TURBO4_0 ||
-                                     layer_type_v == GGML_TYPE_TURBO2_0);
             const uint32_t hd_k = hparams.n_embd_head_k(il);
             const uint32_t hd_v = hparams.n_embd_head_v(il);
             const auto pad128 = [](uint32_t d) { return ((d + 127) / 128) * 128; };
             // What the flash-attention node will actually receive, after the padding applied below.
-            const uint32_t eff_k = k_is_turbo ? pad128(hd_k) : hd_k;
-            const uint32_t eff_v = (v_is_turbo && !is_mla) ? pad128(hd_v) : hd_v;
+            // Must mirror the two `if`s further down exactly; that is why both read pad_both.
+            const uint32_t eff_k = (k_is_turbo || pad_both) ? pad128(hd_k) : hd_k;
+            const uint32_t eff_v = ((v_is_turbo || pad_both) && !is_mla) ? pad128(hd_v) : hd_v;
 
             if (!logged_turbo_fallback && (k_is_turbo || v_is_turbo)) {
                 logged_turbo_fallback = true;
@@ -457,7 +492,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
         }
-        if (k_is_turbo && n_embd_head_k % 128 != 0) {
+        if ((k_is_turbo || pad_both) && n_embd_head_k % 128 != 0) {
             const uint32_t padded_head_k = ((n_embd_head_k + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
             n_embd_k_gqa_eff = n_head_kv * padded_head_k;
@@ -470,8 +505,7 @@ llama_kv_cache::llama_kv_cache(
         // For turbo types, pad V head_dim to next multiple of 128 if needed
         const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
         uint32_t n_embd_v_gqa_eff = n_embd_v_gqa;
-        const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO2_0);
-        if (v_is_turbo && !is_mla && n_embd_head_v % 128 != 0) {
+        if ((v_is_turbo || pad_both) && !is_mla && n_embd_head_v % 128 != 0) {
             const uint32_t padded_head_v = ((n_embd_head_v + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_v_gqa / n_embd_head_v;
             n_embd_v_gqa_eff = n_head_kv * padded_head_v;
@@ -1612,9 +1646,13 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
         assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
     }
 
-    // Use padded head_dim for turbo types so the full padded data is returned
+    // Must mirror the constructor's padding decision exactly, or this view describes a shape the
+    // tensor does not have. Since ADR-0011 a non-turbo K is padded too when V is turbo.
     const uint32_t head_k = hparams.n_embd_head_k(il);
-    const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
+    const ggml_type type_v_l = layers[ikv].v ? layers[ikv].v->type : k->type;
+    const bool pad_both = kv_turbo_pads_both(k->type, type_v_l, head_k,
+                                             hparams.n_embd_head_v(il), hparams.is_mla());
+    const uint32_t head_k_eff = ((k_is_turbo || pad_both) && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
@@ -1638,10 +1676,12 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE] - for turbo-padded V, cache may be larger
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    // Use padded head_dim for turbo types
+    // Mirrors the constructor, as in get_k: a non-turbo V is padded too when K is turbo.
     const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
     const uint32_t head_v = hparams.n_embd_head_v(il);
-    const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
+    const bool pad_both = kv_turbo_pads_both(layers[ikv].k->type, v->type,
+                                             hparams.n_embd_head_k(il), head_v, hparams.is_mla());
+    const uint32_t head_v_eff = ((v_is_turbo || pad_both) && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
@@ -1680,7 +1720,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // k_cur shape here is (n_embd_head, n_head, n_tokens).
     // ggml_pad pads ne[0] with zeros - exactly what we need per-head.
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    const bool k_needs_pad = k_is_turbo && (n_embd_head % 128 != 0);
+    // Mirrors the constructor: when V is turbo the non-turbo K is padded too, so the rows written
+    // here must be as wide as the tensor they are written into. ggml_pad supplies zeros, which is
+    // what makes the padded lanes inert in Q.K^T rather than merely "probably zero".
+    const ggml_type type_v_cpy = layers[ikv].v ? layers[ikv].v->type : k->type;
+    const bool k_pad_both = kv_turbo_pads_both(k->type, type_v_cpy, (uint32_t) n_embd_head,
+                                               hparams.n_embd_head_v(il), hparams.is_mla());
+    const bool k_needs_pad = (k_is_turbo || k_pad_both) && (n_embd_head % 128 != 0);
     if (k_needs_pad) {
         const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
         k_cur = ggml_pad(ctx, k_cur, pad_amount, 0, 0, 0);
@@ -1733,7 +1779,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     // Turbo zero-padding: pad V head_dim to next multiple of 128
     const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
-    const bool v_needs_pad = v_is_turbo && (n_embd_head % 128 != 0);
+    // Mirrors the constructor, as in cpy_k.
+    const bool v_pad_both = kv_turbo_pads_both(layers[ikv].k->type, v->type,
+                                               hparams.n_embd_head_k(il), (uint32_t) n_embd_head,
+                                               hparams.is_mla());
+    const bool v_needs_pad = (v_is_turbo || v_pad_both) && (n_embd_head % 128 != 0);
     if (v_needs_pad) {
         const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
         v_cur = ggml_pad(ctx, v_cur, pad_amount, 0, 0, 0);
