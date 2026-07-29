@@ -6,3 +6,8 @@
 // D=256 with the P2 cooperative-register rework.
 DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+
+// D=256 needs an explicit definition here because this pair IS extern-declared at 256 in
+// fattn-vec.hpp; the TURBO4_0-K rows are absent from that grid and instantiate implicitly.
+// Adding EXTERN_DECL_FATTN_VEC_CASES for TURBO4_0 would break those with LNK2019 (ADR-0004).
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);

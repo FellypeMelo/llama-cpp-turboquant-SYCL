@@ -36,13 +36,19 @@
     FATTN_VEC_CASE(256, type_K, type_V)       \
     FATTN_VEC_CASE(512, type_K, type_V)       \
 
-// Turbo uses nthreads_KQ=1, so each lane holds the full pre-rotated Q in registers. On Intel
-// GPUs (128 GRF/thread in large-GRF mode) that fits for D<=128 but spills catastrophically at
-// D>=256 (the JIT build fails). Restrict turbo to D in {64,128} until the P2 cooperative-register
-// rework lands (CUDA gets D=256 for free only because its GPUs expose 255 regs/thread).
+// Turbo head dims. The old restriction to {64,128} blamed register pressure from nthreads_KQ=1,
+// which stopped being true when the cooperative-register rework landed (SYCL uses 128/cpy_nb).
+// The real ceiling was shared local memory in the final combine: it staged nwarps*V_cols_per_iter
+// partial vectors of length D at once, and since nthreads = max(128, D) the warp count grows with D
+// as well, reaching 16*8*256 = 128 KB at D=256 - twice the Xe2 per-work-group limit, so the kernel
+// failed to JIT and took the whole program down with it. fattn-vec.hpp now stages those partials a
+// few warps at a time and carries the running sum in registers, capping the staging area
+// independently of D. head_dim 256 matters because qwen35 and similar hybrids use it, and without
+// a turbo instance there the whole attention op silently falls back to the CPU (ADR-0008).
 #define FATTN_VEC_CASES_TURBO_D(type_K, type_V) \
     FATTN_VEC_CASE( 64, type_K, type_V)         \
     FATTN_VEC_CASE(128, type_K, type_V)         \
+    FATTN_VEC_CASE(256, type_K, type_V)         \
 
 static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
@@ -322,8 +328,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
         V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     if (KV_is_turbo) {
-        // Turbo vec kernels only exist for D in {64,128} on SYCL (see FATTN_VEC_CASES_TURBO_D).
-        return (can_use_vector_kernel && K->ne[0] <= 128) ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+        // Must track FATTN_VEC_CASES_TURBO_D exactly. Returning NONE here does not select some other
+        // SYCL kernel: it makes ggml_sycl_flash_attn_ext_supported report false, and ggml then runs
+        // the whole attention op on the CPU, silently and roughly 10x slower (ADR-0008).
+        return (can_use_vector_kernel && K->ne[0] <= 256) ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
     }
 
     // Todo: Use the XMX kernel if possible:
@@ -468,6 +476,12 @@ static bool ggml_sycl_flash_attn_ext_turbo_prefill(ggml_backend_sycl_context & c
     };
     if (!is_turbo(V->type)) return false;
     if (!f16able(K->type)) return false;
+    // A turbo K at D>=256 drifts through the f16 TILE: measured rel-MSE 2.2e-2 for turbo3 x turbo3
+    // and 6.2e-3 for turbo4 x turbo3 against a 6e-3 bound, while the SAME pairs through the turbo
+    // VEC kernel measure exactly 0.0 and precise-K x turbo-V through TILE measures 2-3e-4. So the
+    // data and the rotation are right and it is the f16 accumulation over 256 rotated terms that
+    // loses ground. Keep those on VEC, mirroring the (turbo K, q8_0 V) exclusion below.
+    if (is_turbo(K->type) && K->ne[0] >= 256) return false;
     if (is_turbo(K->type) && K->type != V->type && !mixed_width_dispatchable(K->type, V->type)) {
         return false;
     }

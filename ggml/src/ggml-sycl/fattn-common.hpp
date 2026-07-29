@@ -295,20 +295,25 @@ static __dpct_inline__ float vec_dot_fattn_vec_KQ_q8_0(const char * __restrict__
 
 #include "turbo-quants.hpp"
 
-template <int D, int nthreads, typename block_t, float (*dequantize_fn)(const block_t *, int, float)>
+template <int D, int nthreads, typename block_t, int QK, float (*dequantize_fn)(const block_t *, int, float)>
 static __dpct_inline__ float vec_dot_fattn_vec_KQ_turbo_generic(const char * __restrict__ K_c,
                                                                 const void * __restrict__ Q_v,
                                                                 const int * __restrict__ Q_q8,
                                                                 const void * __restrict__ Q_ds_v) {
+    // A K row spans D/QK blocks, each with its own norm. This used to read the norm once from block
+    // 0 and pass the GLOBAL element index straight to dequantize_fn, which expects an index within
+    // a block. At D == QK == 128 those coincide and the bug is invisible; at D=256 every element
+    // past 127 reads block 0 with the wrong offset and the wrong scale, which is why turbo was
+    // restricted to D in {64,128}. dequantize_V_turbo_generic below always did this correctly - only
+    // the K side was single-block.
     const block_t * K_turbo = (const block_t *) K_c;
-    const float norm = __half2float(K_turbo->norm);
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
     // Cooperative across nthreads lanes (mirrors vec_dot_fattn_vec_KQ_f16): each lane dequantizes
     // and dots only its D/nthreads slice of the pre-rotated Q (stored in Q_v as the same strided
     // cpy_ne-block layout the non-turbo register load produces), and the caller sub-group-reduces
-    // the partials. This keeps Q_reg at (D/2)/nthreads per lane — vs the whole D at nthreads==1 —
+    // the partials. This keeps Q_reg at (D/2)/nthreads per lane - vs the whole D at nthreads==1 -
     // which is what lets many warps stay resident and hides KV-read latency at long context.
     constexpr int cpy_nb = ggml_sycl_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
@@ -323,8 +328,13 @@ static __dpct_inline__ float vec_dot_fattn_vec_KQ_turbo_generic(const char * __r
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
             const int hi = k_KQ_0 + lane*cpy_ne + k_KQ_1;   // global half2 index into the D-vector
-            const float k0 = dequantize_fn(K_turbo, 2*hi,     norm);
-            const float k1 = dequantize_fn(K_turbo, 2*hi + 1, norm);
+            // 2*hi is even and QK is a multiple of 2, so both halves land in the same block.
+            const int      ib   = (2*hi) / QK;
+            const int      idq  = (2*hi) % QK;
+            const block_t * blk = K_turbo + ib;
+            const float    norm = __half2float(blk->norm);
+            const float k0 = dequantize_fn(blk, idq,     norm);
+            const float k1 = dequantize_fn(blk, idq + 1, norm);
 #ifdef GGML_SYCL_F16
             const sycl::half2 q = ((const sycl::half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
             sum += k0 * (float) q.x() + k1 * (float) q.y();
@@ -658,11 +668,11 @@ constexpr vec_dot_KQ_t get_vec_dot_KQ() {
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads, warp_size>;
     } else if constexpr (type_K == GGML_TYPE_TURBO2_0) {
-        return vec_dot_fattn_vec_KQ_turbo_generic<D, nthreads, block_turbo2_0, dequantize_turbo2_0>;
+        return vec_dot_fattn_vec_KQ_turbo_generic<D, nthreads, block_turbo2_0, QK_TURBO2, dequantize_turbo2_0>;
     } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
-        return vec_dot_fattn_vec_KQ_turbo_generic<D, nthreads, block_turbo3_0, dequantize_turbo3_0>;
+        return vec_dot_fattn_vec_KQ_turbo_generic<D, nthreads, block_turbo3_0, QK_TURBO3, dequantize_turbo3_0>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
-        return vec_dot_fattn_vec_KQ_turbo_generic<D, nthreads, block_turbo4_0, dequantize_turbo4_0>;
+        return vec_dot_fattn_vec_KQ_turbo_generic<D, nthreads, block_turbo4_0, QK_TURBO4, dequantize_turbo4_0>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;

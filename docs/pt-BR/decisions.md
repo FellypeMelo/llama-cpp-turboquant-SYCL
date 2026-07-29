@@ -499,3 +499,105 @@ Tres interpretacoes foram feitas antes de medir neste dia, e as tres cairam na p
 
 Medir custa minutos. Interpretar estrutura custou dois ciclos de build e uma conclusao publicada
 errada.
+
+---
+
+## ADR-0009 - head_dim 256 no kernel VEC: quatro bugs, nenhum deles registrador
+
+**Data:** 2026-07-29
+**Status:** Aceito (validado na Arc B580, build-perf AOT bmg-g21)
+
+### Contexto
+O ADR-0008 registrou que head_dim fora de {64,128} com turbo faz a flash-attention inteira cair na
+CPU, silenciosamente, ~10x mais lenta. A restricao estava documentada em `fattn.cpp` como pressao de
+registrador vinda de `nthreads_KQ=1`. Essa atribuicao estava **errada**, e provavelmente e o motivo
+de a restricao ter durado tanto: "precisa de reescrita de registrador" desencoraja tentar, enquanto
+os bloqueios reais eram localizados. Alem disso `nthreads_KQ` nao e 1 no SYCL desde a
+cooperative-register rework; usa `128/cpy_nb`.
+
+### Os quatro bloqueios, na ordem em que apareceram
+Cada um so ficou visivel depois que o anterior saiu do caminho. Foram resolvidos um por vez, cada um
+com seu proprio veredito de teste, justamente para nao repetir o erro dos primeiros ciclos, em que
+duas mudancas foram aplicadas juntas e a falha ficou inatribuivel.
+
+1. **LNK2019.** Adicionar `FATTN_VEC_CASE(256, ...)` quebra o link nos 4 combos extern-declarados
+   (`(F16,TURBO3_0)`, `(Q8_0,TURBO3_0)`, `(TURBO3_0,Q8_0)`, `(TURBO3_0,TURBO3_0)`), porque
+   `EXTERN_DECL_FATTN_VEC_CASES` e invocada em D=256 e suprime a instanciacao implicita. Os pares com
+   TURBO4_0 no K linkam sozinhos - nao estao na grade extern. Confirma o ADR-0004 na pratica.
+   **Resolvido:** definicoes explicitas nos 4 arquivos de instancia.
+
+2. **SLM.** O combine encenava `nwarps * V_cols_per_iter` vetores parciais de tamanho D de uma vez.
+   Como `nthreads = max(128, D)`, o numero de warps cresce com D: em D=256 sao 16*8*256 = **128 KB**,
+   o dobro do teto por work-group do Xe2. O kernel nao compila no device e derruba o programa
+   inteiro - D=128 para de funcionar junto.
+   **Resolvido:** encenar `combine_warp_chunk` warps por vez com a soma corrente em registrador. A
+   reducao e elementwise em D, sem dependencia cruzada, entao o agrupamento e livre.
+   **Validado independentemente:** forcar chunk=4 tambem em D=128 (2 passes em vez de 1) manteve os
+   71 casos D=128 verdes, provando que o caminho multi-passe esta correto por si.
+
+3. **Descompasso host/device.** `ggml_sycl_flash_attn_ext_vec_case_impl` calculava
+   `nthreads` a partir de um helper de host que devolve 128 fixo, enquanto o kernel computa
+   `max(128, D)`. Em D>128 o kernel acreditava ter o dobro das threads e dos warps que recebeu: o
+   combine somava sobre 16 warps existindo 8, e `KQ[j*nthreads + k]` indexava alem do que as threads
+   lancadas escreveram. Resultado: lixo (cosine ~0). Em D<=128 os dois lados dao 128, e por isso
+   ficou invisivel desde sempre.
+   **Este nao e um bug do turbo.** Atinge qualquer tipo de KV no vec acima de D=128, e
+   `FATTN_VEC_CASES_ALL_D` sempre emitiu instancias em 256 e 512 para f16/q4_0/q5_0/q8_0.
+   **Resolvido:** o host passa a computar a mesma formula.
+
+4. **Precisao do TILE.** Com o VEC funcionando, sobrou um K turbo em D=256 pelo f16 TILE medindo
+   rel-MSE 2,2e-2 (turbo3 x turbo3) e 6,2e-3 (turbo4 x turbo3) contra um limite de 6e-3, enquanto os
+   **mesmos pares pelo VEC medem exatamente 0,0** e K preciso pelo TILE mede 2-3e-4. Dados e rotacao
+   corretos; e a soma em f16 de 256 termos rotacionados que perde terreno.
+   **Resolvido:** K turbo em D>=256 fica no VEC (o shim recusa), espelhando a exclusao de
+   `(turbo K, q8_0 V)` do ADR-0006.
+
+### Evidencia (Arc B580, build-perf AOT, qwen35 9B Q4_K_M, head_dim 256)
+`llama-bench` pp2048, antes -> depois:
+
+| config | antes | depois | vs f16 |
+|--------|------:|-------:|-------:|
+| q8_0 x turbo3 |  139,37 | **1474,95** | 99,9% |
+| q8_0 x turbo4 |      -  | **1471,50** | 99,7% |
+| q8_0 x q8_0   | 1401,26 | 1464,30 | 99,2% |
+| f16 x f16     | 1426,91 | 1476,65 |    -   |
+
+**10,6x** no par turbo. tg32 40,67 -> 44,97.
+
+Repare que `q8_0 x q8_0` e `f16 x f16` tambem subiram sem que o caminho deles fosse tocado: e o
+bloqueio 3 beneficiando todo tipo de KV em D=256. Confirmado direto pelo golden, que ganhou casos
+`f16xf16`, `q8_0xq8_0` e `q4_0xq4_0` em D=256 - todos passam.
+
+- Golden `test-sycl-turbo` sob AOT: **85 PASSED / 0 FAILED**.
+- e2e `test-e2e-turbo-kv.sh` sob AOT: **11/11 coerentes**.
+- DLL AOT: 253 -> 269,7 MB (**+6,6%**) pelos kernels D=256.
+
+### head_dim 512 continua quebrado, e nao e do turbo
+Reproduzido ao adicionar casos: `f16 x f16` e `q8_0 x q8_0` em D=512, n_q=1, dao cosine **0,039** e
+**0,047**, rel-MSE na casa de 1e7. Ja estava quebrado **antes** do bloqueio 3 ser corrigido (o
+descompasso ali era de 4x) e continua depois, entao ha uma terceira causa especifica de D=512 que nao
+foi encontrada. `FATTN_VEC_CASES_ALL_D` emite essas instancias e o router as alcanca, entao qualquer
+modelo de head_dim 512 no caminho vec do SYCL e afetado, com qualquer tipo de KV. Os casos foram
+removidos do gate para ele nao nascer vermelho; a reproducao esta em comentario em
+`tests/test-sycl-turbo.cpp` e reativa-la e uma edicao so.
+
+### Divergencia com upstream, que vai conflitar
+O upstream **ja corrigiu o bloqueio 3**, no commit `c1063ac9d` ("sycl: set fattn_vec_nthreads to 256
+for Battlemage", PR #25205, 2026-07-14), que **nao** esta no nosso HEAD. A abordagem deles e melhor
+na estrutura: apagam os dois helpers e passam `nthreads` como parametro de template, eliminando a
+dupla fonte de verdade em vez de sincroniza-la. A semantica tambem difere - eles querem 256 threads
+na Battlemage em **qualquer** D (e ganho de desempenho), enquanto aqui e `max(128, D)`.
+
+Eles tambem bateram no mesmo teto de SLM e escolheram **capar**: o commit traz
+`// 256 threads would overflow the 64 KB work-group local memory at D == 512, so keep 128 there`.
+O fatiamento do bloqueio 2 remove essa necessidade em D=256; em D=512 nao ajuda, porque a causa la e
+outra (ver secao acima).
+
+**O proximo `git merge upstream/master` (ADR-0001) vai conflitar em `fattn-vec.hpp`, e nao e conflito
+textual:** exige decidir se o combine fatiado composta com o `nthreads` por arquitetura deles. A
+resolucao provavelmente certa e adotar a estrutura do upstream (parametro de template) e manter o
+fatiamento por cima, o que permitiria remover o cap de D=512 deles - mas so depois de achar a
+terceira causa.
+
+Achado por revisao adversarial olhando `git log` do upstream, fora do escopo dos arquivos do diff.
+Nenhuma das quatro lentes de codigo teria encontrado.

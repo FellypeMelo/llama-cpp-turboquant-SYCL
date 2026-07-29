@@ -147,7 +147,21 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     __builtin_assume(tid < nthreads);
 
     constexpr int ne_KQ      = ncols*D;
-    constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+    // The final combine reduces nwarps*V_cols_per_iter partial output vectors of length D, and it
+    // used to stage all of them in shared memory at once. That is nwarps*V_cols_per_iter*D floats,
+    // and since nthreads = max(128, D) the warp count itself grows with D: at D=256 it reaches
+    // 16*8*256 = 128 KB, twice the Xe2 per-work-group ceiling, so the kernel fails to JIT and takes
+    // the whole program down with it (D=128 stops working too).
+    // The reduction over D is elementwise and has no cross-element dependency, so the partials can
+    // be staged a few warps at a time while each thread carries its running sum in registers.
+    // combine_warp_chunk == nwarps reproduces the original single-pass behaviour exactly, which is
+    // what D<=128 keeps.
+    // Verified by bisect: forcing chunk=4 at D=128 too (2 passes instead of 1) keeps all 71 D=128
+    // cases green, so the multi-pass path is correct. D<=128 stays single-pass only to avoid the
+    // extra barriers, not because multi-pass is unproven there.
+    constexpr int combine_warp_chunk = (D >= 256 && nwarps >= 4) ? 4 : nwarps;
+    static_assert(nwarps % combine_warp_chunk == 0, "combine_warp_chunk must divide nwarps");
+    constexpr int ne_combine = combine_warp_chunk*V_cols_per_iter*D;
 
     constexpr size_t lsm_size1 = ncols * warp_size;
     constexpr size_t lsm_size2 = ncols * warp_size;
@@ -519,38 +533,18 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         const float kqmax_scale = sycl::native::exp((float) (KQ_max[j_VKQ] - kqmax_new));
         KQ_max[j_VKQ] = kqmax_new;
 
+        // Scale the register-resident partials once, before any staging.
 #ifdef GGML_SYCL_F16
-        sycl::half2 * VKQ_tmp = (sycl::half2 *) KQ + item_ct1.get_local_id(1) * (V_cols_per_iter * D / 2) +
-                                (nthreads_V == warp_size ? 0 : item_ct1.get_local_id(2) / nthreads_V) * (D / 2);
-
         const sycl::half2 kqmax_scale_h2 = sycl::half2(kqmax_scale, kqmax_scale);
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
             VKQ[j_VKQ][i_VKQ_0/nthreads_V] *= kqmax_scale_h2;
         }
-#pragma unroll
-        for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
-            const int i_VKQ =
-                i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V) *
-                              (V_rows_per_thread / 2);
-
-            ggml_sycl_memcpy_1<V_rows_per_thread * sizeof(sycl::half)>(VKQ_tmp + i_VKQ,
-                                                                       &VKQ[j_VKQ][i_VKQ_0 / nthreads_V]);
-        }
 #else
-        sycl::float2 * VKQ_tmp = (sycl::float2 *) KQ + item_ct1.get_local_id(1)*(V_cols_per_iter*D/2)
-            + (nthreads_V == warp_size ? 0 : item_ct1.get_local_id(2) / nthreads_V)*(D/2);
 #pragma unroll
         for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
             VKQ[j_VKQ][i_VKQ_0/nthreads_V].x() *= kqmax_scale;
             VKQ[j_VKQ][i_VKQ_0/nthreads_V].y() *= kqmax_scale;
-        }
-#pragma unroll
-        for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
-            const int i_VKQ = i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V)*(V_rows_per_thread/2);
-
-            ggml_sycl_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
-            ggml_sycl_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ + V_rows_per_thread/4, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + V_rows_per_thread/4]);
         }
 #endif // GGML_SYCL_F16
 
@@ -560,23 +554,65 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             KQ_sum_shared[j_VKQ*warp_size+item_ct1.get_local_id(1)] = KQ_sum[j_VKQ];
         }
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        // Stage the partials combine_warp_chunk warps at a time and keep the running sum in
+        // registers. With combine_warp_chunk == nwarps this is one pass and matches the original.
+        constexpr int dst_per_thread = (D + nthreads - 1) / nthreads;
+        float dst_acc[dst_per_thread] = { 0.0f };
 
+        const int warp_id = item_ct1.get_local_id(1);
+
+        for (int wg = 0; wg < nwarps; wg += combine_warp_chunk) {
+            // Wait for the previous chunk's readers before overwriting the staging area.
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+
+            if (warp_id >= wg && warp_id < wg + combine_warp_chunk) {
+#ifdef GGML_SYCL_F16
+                sycl::half2 * VKQ_tmp = (sycl::half2 *) KQ + (warp_id - wg) * (V_cols_per_iter * D / 2) +
+                                        (nthreads_V == warp_size ? 0 : item_ct1.get_local_id(2) / nthreads_V) * (D / 2);
+#pragma unroll
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                    const int i_VKQ = i_VKQ_0 +
+                        (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V) *
+                        (V_rows_per_thread / 2);
+                    ggml_sycl_memcpy_1<V_rows_per_thread * sizeof(sycl::half)>(VKQ_tmp + i_VKQ,
+                                                                               &VKQ[j_VKQ][i_VKQ_0 / nthreads_V]);
+                }
+#else
+                sycl::float2 * VKQ_tmp = (sycl::float2 *) KQ + (warp_id - wg)*(V_cols_per_iter*D/2)
+                    + (nthreads_V == warp_size ? 0 : item_ct1.get_local_id(2) / nthreads_V)*(D/2);
+#pragma unroll
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                    const int i_VKQ = i_VKQ_0 +
+                        (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V)*(V_rows_per_thread/2);
+                    ggml_sycl_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
+                    ggml_sycl_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ + V_rows_per_thread/4, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + V_rows_per_thread/4]);
+                }
+#endif // GGML_SYCL_F16
+            }
+
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+
+            if (nthreads <= D || tid < D) {
+#pragma unroll
+                for (int i0 = 0, k = 0; i0 < D; i0 += nthreads, ++k) {
+#pragma unroll
+                    for (int w = 0; w < combine_warp_chunk; ++w) {
+#pragma unroll
+                        for (int v = 0; v < V_cols_per_iter; ++v) {
+                            dst_acc[k] += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
+                        }
+                    }
+                }
+            }
+        }
 
         if (nthreads <= D || tid < D) {
             KQ_sum[j_VKQ] = KQ_sum_shared[j_VKQ*warp_size+item_ct1.get_local_id(2)];
             KQ_sum[j_VKQ] = warp_reduce_sum<warp_size>(KQ_sum[j_VKQ]);
 
 #pragma unroll
-            for (int i0 = 0; i0 < D; i0 += nthreads) {
-                float dst_val = 0;
-#pragma unroll
-                for (int w = 0; w < nwarps; ++w) {
-#pragma unroll
-                    for (int v = 0; v < V_cols_per_iter; ++v) {
-                        dst_val += float(KQ[w*V_cols_per_iter*D + v*D + i0 + tid]);
-                    }
-                }
+            for (int i0 = 0, k = 0; i0 < D; i0 += nthreads, ++k) {
+                float dst_val = dst_acc[k];
                 if (item_ct1.get_group_range(1) == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
@@ -622,7 +658,14 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
 
     const int cc = ggml_sycl_info().devices[ggml_sycl_get_device()].cc;
 
-    const int nthreads = ggml_sycl_fattn_vec_get_nthreads_host(cc);
+    // Must mirror the kernel's own constexpr nthreads = max(device_nthreads, D). The host used to
+    // launch a flat 128 threads while the kernel computed max(128, D), so at D>128 the kernel
+    // believed it had twice the threads and warps it was actually given: the combine summed over
+    // nwarps=16 partials when only 8 existed, and KQ[j*nthreads + k] indexed past what the launched
+    // threads had written. Results were garbage (golden cosine near zero) for every type, not just
+    // turbo. At D<=128 both sides yield 128, which is why this stayed invisible.
+    const int nthreads_host = ggml_sycl_fattn_vec_get_nthreads_host(cc);
+    const int nthreads = nthreads_host > D ? nthreads_host : D;
     const int nwarps   = nthreads / warp_size;
 
     const bool need_f16_K = type_K == GGML_TYPE_F16;

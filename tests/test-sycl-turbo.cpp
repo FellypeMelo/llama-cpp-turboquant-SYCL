@@ -32,6 +32,9 @@ extern "C" {
 static void quantize_row_q8_0_ref_wrap(const float * x, void * y, int64_t k) {
     ggml_quantize_chunk(GGML_TYPE_Q8_0, x, y, 0, 1, k, nullptr);
 }
+static void quantize_row_q4_0_ref_wrap(const float * x, void * y, int64_t k) {
+    ggml_quantize_chunk(GGML_TYPE_Q4_0, x, y, 0, 1, k, nullptr);
+}
 static void quantize_row_f16_ref_wrap(const float * x, void * y, int64_t k) {
     ggml_fp32_to_fp16_row(x, (ggml_fp16_t *) y, k);
 }
@@ -519,7 +522,9 @@ static bool run_fattn_turbo_golden_test_nq(ggml_backend_t backend, ggml_type typ
         // pass. Do not "fix" such a failure by widening the tolerance.
         const bool mixed_ok   = type_K == GGML_TYPE_TURBO4_0 &&
                                 (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0);
-        const bool uses_tile  = v_is_turbo && !(k_is_turbo && type_K != type_V && !mixed_ok) && n_q >= 16;
+        // Mirrors the shim: turbo K at D>=256 stays on VEC (the f16 TILE drifts there).
+        const bool uses_tile  = v_is_turbo && !(k_is_turbo && type_K != type_V && !mixed_ok)
+                                && !(k_is_turbo && D >= 256) && n_q >= 16;
         const bool q_is_q8_1  = !uses_tile && type_K != GGML_TYPE_F16 && !k_is_turbo;
         // A q8_0 V also takes a different dequant path in the vec kernel than a turbo V, and the
         // AOT (bmg-g21) compiler schedules it with slightly wider error than the JIT: the same
@@ -950,14 +955,39 @@ int main() {
     for (const auto & c : mixed_cfgs)
         success &= run_fattn_turbo_decode_mask_gqa(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V);
 
-    // head_dim 256 is NOT covered: FATTN_VEC_CASES_TURBO_D caps turbo at D in {64,128}. Attempted
-    // 2026-07-29 and reverted. The blocker is shared local memory, not registers as the macro's
-    // comment claims: ne_combine = nwarps*V_cols_per_iter*D is 8*8*256 = 64 KB at D=256, which is
-    // the Xe2 per-work-group ceiling, so the kernel fails to JIT and takes the whole program with
-    // it (D=128 stops working too). Lowering nthreads_V shrinks that, but the turbo V dequant
-    // assumes each lane covers a whole 128-block, and breaking that gave golden cosine -0.34.
-    // Both directions are blocked, so D=256 needs real kernel work. Until then a head_dim-256
-    // model gets a warning at load (llama-kv-cache.cpp) and runs attention on the CPU.
+    // head_dim 256. Two QK_TURBO blocks per row. Previously uncovered: with no turbo vec instance
+    // the router returned NONE, ggml_sycl_flash_attn_ext_supported reported false, and ggml ran the
+    // whole attention op on the CPU with no diagnostic (ADR-0008). Enabled once the combine stopped
+    // staging every warp's partial vector in shared memory at once.
+    printf("\n=== FA turbo golden parity, head_dim 256 ===\n");
+    {
+        const asym_cfg d256_cfgs[] = {
+            { GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0, "q8_0xTURBO3_0",     quantize_row_q8_0_ref_wrap, quantize_row_turbo3_0_ref },
+            { GGML_TYPE_F16,      GGML_TYPE_TURBO3_0, "f16xTURBO3_0",      quantize_row_f16_ref_wrap,  quantize_row_turbo3_0_ref },
+            { GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, "TURBO3_0",          quantize_row_turbo3_0_ref,  quantize_row_turbo3_0_ref },
+            { GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, "TURBO4_0xTURBO3_0", quantize_row_turbo4_0_ref,  quantize_row_turbo3_0_ref },
+            // Non-turbo at D=256 too: the host/device nthreads disagreement fixed alongside this
+            // was never turbo-specific, so f16 and q8_0 KV on the vec path were equally affected.
+            // These cases exist to keep that fixed rather than to exercise turbo.
+            { GGML_TYPE_F16,      GGML_TYPE_F16,      "f16xf16",           quantize_row_f16_ref_wrap,  quantize_row_f16_ref_wrap },
+            { GGML_TYPE_Q8_0,     GGML_TYPE_Q8_0,     "q8_0xq8_0",         quantize_row_q8_0_ref_wrap, quantize_row_q8_0_ref_wrap },
+            { GGML_TYPE_Q4_0,     GGML_TYPE_Q4_0,     "q4_0xq4_0",         quantize_row_q4_0_ref_wrap, quantize_row_q4_0_ref_wrap },
+        };
+        for (const auto & c : d256_cfgs) {
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 1,  256, 256);
+            success &= run_fattn_turbo_golden_test_nq(backend, c.type_K, c.type_V, c.name, c.qref_K, c.qref_V, 16, 256, 256);
+        }
+    }
+
+    // head_dim 512 is NOT covered, and is BROKEN independently of this change. Reproduced
+    // 2026-07-29 on an Arc B580 by adding f16xf16 and q8_0xq8_0 at D=512, n_q=1: cosine 0.039 and
+    // 0.047, rel-MSE 2.8e7 and 4.6e7. It was already broken before the host/kernel nthreads fix in
+    // this change (the host launched 128 threads while the kernel assumed max(128,512) = 512, a 4x
+    // mismatch), and it stays broken after, so a third D=512-specific cause remains unfound.
+    // FATTN_VEC_CASES_ALL_D has always emitted these instances and the router reaches them, so any
+    // head_dim-512 model on the SYCL vec path is affected - this is not turbo-specific.
+    // Upstream c1063ac9d sidesteps it by pinning 128 threads at D=512. Re-add these two cases when
+    // someone takes that on; they fail loudly and immediately.
 
     // Deep context. Every case above runs at n_kv=256, i.e. ntiles_KQ=2, so launch_fattn almost
     // never picks parallel_blocks > 1 and flash_attn_combine_results stays largely unexercised.
