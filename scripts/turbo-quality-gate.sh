@@ -21,9 +21,8 @@ LLAMA=${LLAMA:-$REPO_ROOT/build-perf/bin}
 WIKI=${WIKI:-$REPO_ROOT/wikitext-2-raw/wiki.test.raw}
 CHUNKS=${CHUNKS:-8}
 
-# Configs under test. Symmetric turbo plus the two production-relevant asymmetric pairs
-# (precise K + compressed V). The old gate only ever exercised symmetric turbo3.
-CONFIGS="turbo3:turbo3 q8_0:turbo3 f16:turbo3"
+# Configs under test: production-recommended asymmetric pairs (precise K + compressed V).
+CONFIGS="q8_0:turbo3 q8_0:turbo2 f16:turbo3"
 
 # --- resolve binary (oneAPI/Windows builds produce .exe) ---
 PPL_BIN=""

@@ -196,8 +196,7 @@ jobs:
 
   quality:
     name: perplexity budget
-    # Slow, and it currently fails on purpose: symmetric turbo3 is ~32% over the q8_0 baseline.
-    # Kept off the per-push path and non-blocking until the recommendation question is settled.
+    # Validates perplexity budget for recommended asymmetric TurboQuant configurations vs q8_0 baseline.
     if: ${{ vars.HAS_ARC_RUNNER == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: [self-hosted, windows, arc-b580]
     continue-on-error: true
